@@ -22,6 +22,7 @@ import pandas as pd
 from .errors import UserError
 
 MAX_UPLOAD_BYTES = 50 * 1024 * 1024  # 50 MB
+MAX_XLSX_UNCOMPRESSED_BYTES = 300 * 1024 * 1024  # zip-bomb guard for workbooks
 MAX_ROWS = 100_000
 
 # Strings that mean "no value" when found in keyword / url cells.
@@ -112,6 +113,25 @@ def read_table(file_bytes: bytes, filename: str = "upload") -> pd.DataFrame:
         )
 
     if file_bytes[:4] == _XLSX_MAGIC:
+        # Pre-check: xlsx is a zip; a crafted "bomb" can expand a tiny upload
+        # into gigabytes in memory. Reject on declared uncompressed size
+        # before handing anything to openpyxl.
+        try:
+            import zipfile
+
+            with zipfile.ZipFile(io.BytesIO(file_bytes)) as zf:
+                declared = sum(info.file_size for info in zf.infolist())
+            if declared > MAX_XLSX_UNCOMPRESSED_BYTES:
+                raise UserError(
+                    "FILE_TOO_LARGE",
+                    "The workbook expands to more than "
+                    f"{MAX_XLSX_UNCOMPRESSED_BYTES // 1_048_576} MB when opened. "
+                    "Export the data as CSV instead.",
+                )
+        except UserError:
+            raise
+        except Exception:
+            pass  # not a readable zip: let openpyxl produce the parse error
         try:
             df = pd.read_excel(io.BytesIO(file_bytes), engine="openpyxl")
         except Exception as exc:
