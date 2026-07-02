@@ -1,12 +1,15 @@
-pandas>=2.0.0
-numpy>=1.24.0
+# Pinned for reproducibility: the pipeline's NaN handling is written to be
+# correct on both pandas 2.x and 3.x (verified by the test suite on both).
+pandas>=2.2,<4
+numpy>=1.26,<3
 scipy>=1.10.0
 scikit-learn==1.5.0
-fastapi>=0.110.0
+fastapi==0.139.0
+starlette==0.47.2
 uvicorn[standard]>=0.27.0
 python-multipart==0.0.22
 openpyxl>=3.1.0
+xlrd>=2.0.1
+charset-normalizer>=3.3
 # Optional for higher-quality embeddings:
 # sentence-transformers>=2.7.0
-
-starlette==0.47.2
