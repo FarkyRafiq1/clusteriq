@@ -64,6 +64,7 @@ DEFAULT_EXPORT_COLUMNS = [
     "topic_label",
     "intent",
     "page_type",
+    "is_clustered",
     "cluster_quality",
     "opportunity_score",
     "volume",
