@@ -67,10 +67,39 @@ User-input problems return HTTP 400 with a structured payload:
 Codes include `EMPTY_FILE`, `FILE_TOO_LARGE`, `TOO_MANY_ROWS`,
 `UNPARSEABLE_FILE`, `UNPARSEABLE_XLSX`, `UNPARSEABLE_XLS`,
 `KEYWORD_COLUMN_NOT_FOUND`, `NO_KEYWORDS`, `NO_ROWS`.
-Internal bugs return HTTP 500 with a reference id and are logged — they are
-never disguised as 400s.
+Abuse controls use their own statuses: HTTP 429 `RATE_LIMITED` (with a
+`Retry-After` header) and HTTP 503 `SERVER_BUSY` when all clustering slots
+are taken. Internal bugs return HTTP 500 with a reference id and are
+logged — they are never disguised as 400s.
 
-Limits: 50 MB upload, 100,000 rows.
+Limits: 50 MB upload (enforced while streaming, plus a decompressed-size
+guard for xlsx), 100,000 rows.
+
+## Security & operations
+
+Configure these environment variables (Railway -> service -> Variables):
+
+- `ALLOWED_ORIGINS` — comma-separated frontend origins, e.g.
+  `https://yourapp.lovable.app`. Defaults to `*` for development and logs a
+  startup warning; set it before public launch.
+- `RATE_LIMIT_PER_MINUTE` — per-IP requests/minute shared across `/preview`
+  and `/cluster` (default 10; `0` disables).
+- `MAX_CONCURRENT_JOBS` — simultaneous clustering jobs (default 2); beyond
+  this, clients get an immediate 503 instead of piling onto the CPU.
+- `TRUST_PROXY_HEADERS` — leave at the default `1` behind Railway's proxy so
+  rate limits key on the real client IP (rightmost `X-Forwarded-For` entry);
+  set `0` only if the app is ever exposed directly.
+
+Design notes: the pipeline runs in a threadpool, so `/health` and new
+requests stay responsive while jobs run. Rate limiting and job slots are
+in-process — correct for a single Railway instance; if you scale to
+multiple replicas, move them to a shared store (e.g. Redis). CORS protects
+browser users from other websites, not scripted callers — the rate limiter
+covers those; per-user API access needs real authentication (e.g. Supabase
+JWTs), which is a product feature rather than a config flag. Frontend note:
+when exporting clusters to CSV, prefix cell values starting with `=`, `+`,
+`-` or `@` to neutralise spreadsheet formula injection — keyword text is
+arbitrary user input.
 
 ## Example local run
 ```bash

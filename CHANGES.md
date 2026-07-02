@@ -42,3 +42,23 @@ All items below correspond to defects reproduced against the previous code
 - Pinned requirements (incl. xlrd, charset-normalizer); code verified on
   pandas 2.2.x and 3.0.x; CI workflow runs the suite on both
 - `.gitignore`; committed `__pycache__` removed
+
+# Changes — API hardening (July 2026)
+
+- Clustering now runs in a threadpool with a concurrency cap
+  (`MAX_CONCURRENT_JOBS`, default 2): the event loop stays responsive
+  during jobs (worst stall measured: 41ms during a 4k-keyword run) and
+  excess jobs get HTTP 503 `SERVER_BUSY` + Retry-After instead of
+  stacking up on the CPU.
+- Per-IP token-bucket rate limiting on `/preview` and `/cluster`
+  (`RATE_LIMIT_PER_MINUTE`, default 10) -> HTTP 429 `RATE_LIMITED` +
+  Retry-After. Keys on the proxy-appended client IP (rightmost
+  X-Forwarded-For; `TRUST_PROXY_HEADERS=0` to use socket addresses).
+- Upload size enforced while streaming: over-declared Content-Length is
+  rejected before reading; undeclared oversized bodies are cut off at the
+  first excess chunk (previously the whole body was buffered first).
+- xlsx decompression-bomb guard: workbooks declaring > 300 MB uncompressed
+  are rejected before openpyxl parses them.
+- CORS origins now come from `ALLOWED_ORIGINS` (comma-separated); `*`
+  remains the dev default and logs a startup warning.
+- 15 new tests (44 total), still verified on pandas 2.x and 3.x.
