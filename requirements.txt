@@ -11,5 +11,8 @@ python-multipart==0.0.22
 openpyxl>=3.1.0
 xlrd>=2.0.1
 charset-normalizer>=3.3
+# Test-only: FastAPI's TestClient (used by tests/test_cost_controls.py) requires
+# httpx. Harmless in production; only imported by the test suite.
+httpx>=0.27
 # Optional for higher-quality embeddings:
 # sentence-transformers>=2.7.0
