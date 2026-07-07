@@ -125,3 +125,26 @@ engine behind:
 - show cluster detail
 - show opportunity cards
 - export cluster rows and cluster summaries
+
+
+### GET `/health`
+Liveness plus lightweight runtime stats: `active_jobs`, `max_jobs`, and cache
+hit/miss counts. Wire this as the platform healthcheck (already set in
+`railway.toml`).
+
+## Operations / cost controls
+
+Tunable via environment variables (see `railway.toml` for recommended values):
+
+| Variable | Default | Purpose |
+|----------|---------|---------|
+| `RATE_LIMIT_PER_MINUTE` | 120 | Per-IP request cap. All frontend traffic arrives from one edge-function egress IP, so treat this as a **global** limit. `0` disables. |
+| `MAX_CONCURRENT_JOBS` | 2 | Simultaneous clustering jobs; excess gets `503 SERVER_BUSY`. Size to CPU. |
+| `MAX_UPLOAD_MB` | 50 | Hard upload cap. **Keep in sync with the storage bucket (20 MB).** |
+| `HEAVY_JOB_ROW_LIMIT` | 50000 | Rows above which `/cluster` fast-fails with `413 TOO_MANY_ROWS` before the expensive stages. `0` = up to the pipeline's absolute `MAX_ROWS`. |
+| `CLUSTER_CACHE_SIZE` | 64 | Cached result entries; identical re-runs are free. `0` disables. |
+| `CLUSTER_CACHE_MB` | 128 | Total cache byte budget. |
+| `ALLOWED_ORIGINS` | `*` | CORS allow-list (not load-bearing for the server-to-server call path, but set before public launch). |
+
+`/cluster` responses include `cached` (bool) and, on a fresh run, `timing_ms`.
+The clustering pipeline is deterministic (`random_state`), so caching is safe.

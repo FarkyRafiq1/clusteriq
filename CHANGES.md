@@ -1,3 +1,24 @@
+## v1.3.0 — practical cost & throughput controls
+
+- **Result cache**: identical (file + column mapping) re-runs are served from an
+  in-process LRU cache (SHA-256 keyed), returning instantly and spending no CPU.
+  Bounded by entry count and total bytes; `CLUSTER_CACHE_SIZE=0` disables it.
+  Responses gain a `cached` boolean.
+- **Heavy-job guard**: `/cluster` fast-fails files over `HEAVY_JOB_ROW_LIMIT`
+  (default 50k) rows with a clear `413 TOO_MANY_ROWS` *before* the expensive
+  vectorize/cluster stages, protecting CPU and request-timeout budget.
+- **Timing/observability**: `/cluster` responses include `timing_ms`; `/health`
+  now reports `active_jobs`, `max_jobs` and cache stats.
+- **Deploy defaults for the real call pattern**: `RATE_LIMIT_PER_MINUTE` default
+  raised to 120 (all traffic shares one edge-function egress IP, so the per-IP
+  limit is effectively global); `MAX_UPLOAD_MB` env override added and documented
+  to stay in sync with the 20 MB storage bucket; `/health` wired as the Railway
+  healthcheck.
+- **Modernisation**: replaced the deprecated `@app.on_event("startup")` with a
+  `lifespan` handler (no behaviour change; removes the DeprecationWarning).
+- Response contract for the frontend is unchanged; new fields are additive and
+  never include `job_id`.
+
 # Changes — parsing & NaN overhaul (July 2026)
 
 All items below correspond to defects reproduced against the previous code

@@ -3,5 +3,16 @@ builder = "NIXPACKS"
 
 [deploy]
 startCommand = "uvicorn clusteriq_engine.api:app --host 0.0.0.0 --port $PORT"
+healthcheckPath = "/health"
+healthcheckTimeout = 120
 restartPolicyType = "ON_FAILURE"
 restartPolicyMaxRetries = 10
+
+# Recommended Railway Variables (set in the dashboard, not committed):
+#   ALLOWED_ORIGINS       = https://<your-frontend-domain>
+#   RATE_LIMIT_PER_MINUTE = 120        # shared across all users (one egress IP)
+#   MAX_CONCURRENT_JOBS   = 2          # size to the instance's CPU
+#   MAX_UPLOAD_MB         = 20         # keep in sync with the Supabase bucket
+#   HEAVY_JOB_ROW_LIMIT   = 50000      # fast-fail bigger files with a clear 413
+#   CLUSTER_CACHE_SIZE    = 64         # identical re-runs served from cache
+#   CLUSTER_CACHE_MB      = 128
