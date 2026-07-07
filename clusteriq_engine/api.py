@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import logging
 import os
+import time
 import uuid
+from contextlib import asynccontextmanager
 from typing import Any, Dict, Optional
 
 import pandas as pd
@@ -11,6 +13,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from starlette.concurrency import run_in_threadpool
 
+from .cache import ResultCache, result_cache_key
 from .errors import UserError
 from .hardening import JobSlots, RateLimiter, ServerBusy, client_ip, read_upload_limited
 from .ingest import MAX_UPLOAD_BYTES, resolve_columns
@@ -25,18 +28,51 @@ logger = logging.getLogger("clusteriq")
 # --------------------------------------------------------------------- #
 # ALLOWED_ORIGINS         comma-separated frontend origins; "*" = any (dev only)
 # RATE_LIMIT_PER_MINUTE   per-IP requests/min across /preview + /cluster; 0 = off
+#                         NOTE: when the frontend calls this backend server-to-
+#                         server (via the Supabase edge function) EVERY request
+#                         shares ONE egress IP, so this is effectively a GLOBAL
+#                         limit. The default is set high for that reason; drop it
+#                         only if clients hit the backend directly per-user.
 # MAX_CONCURRENT_JOBS     simultaneous clustering jobs; 0 = unlimited
+# MAX_UPLOAD_MB           hard upload cap; keep in sync with the storage bucket
+# HEAVY_JOB_ROW_LIMIT     rows above which /cluster is refused synchronously with
+#                         a clear 413 (protects CPU/time budget). 0 = allow up to
+#                         the pipeline's absolute MAX_ROWS.
+# CLUSTER_CACHE_SIZE      cached result entries (identical re-runs are free); 0=off
+# CLUSTER_CACHE_MB        total cache budget in MB
 # TRUST_PROXY_HEADERS     "1" behind Railway's proxy (default); "0" if exposed directly
 ALLOWED_ORIGINS = [
     origin.strip()
     for origin in os.getenv("ALLOWED_ORIGINS", "*").split(",")
     if origin.strip()
 ] or ["*"]
-RATE_LIMIT_PER_MINUTE = int(os.getenv("RATE_LIMIT_PER_MINUTE", "10"))
+# High default because all traffic arrives from one edge-function IP (see note).
+RATE_LIMIT_PER_MINUTE = int(os.getenv("RATE_LIMIT_PER_MINUTE", "120"))
 MAX_CONCURRENT_JOBS = int(os.getenv("MAX_CONCURRENT_JOBS", "2"))
+HEAVY_JOB_ROW_LIMIT = int(os.getenv("HEAVY_JOB_ROW_LIMIT", "50000"))
+_CACHE_ENTRIES = int(os.getenv("CLUSTER_CACHE_SIZE", "64"))
+_CACHE_BYTES = int(os.getenv("CLUSTER_CACHE_MB", "128")) * 1024 * 1024
 TRUST_PROXY_HEADERS = os.getenv("TRUST_PROXY_HEADERS", "1") != "0"
 
-app = FastAPI(title="ClusterIQ Engine", version="1.2.0")
+
+@asynccontextmanager
+async def _lifespan(app: FastAPI):
+    # Startup: warn once if CORS is wide open (harmless for the server-to-server
+    # call path, but worth flagging before a public launch).
+    if "*" in ALLOWED_ORIGINS:
+        logger.warning(
+            "CORS is open to all origins. Set ALLOWED_ORIGINS to your frontend "
+            "origin (e.g. https://yourapp.lovable.app) before public launch."
+        )
+    logger.info(
+        "ClusterIQ Engine up: rate_limit/min=%s max_jobs=%s cache_entries=%s heavy_row_limit=%s",
+        RATE_LIMIT_PER_MINUTE, MAX_CONCURRENT_JOBS, _CACHE_ENTRIES, HEAVY_JOB_ROW_LIMIT,
+    )
+    yield
+    # Shutdown: nothing to clean up (in-process state is GC'd).
+
+
+app = FastAPI(title="ClusterIQ Engine", version="1.3.0", lifespan=_lifespan)
 
 app.add_middleware(
     CORSMiddleware,
@@ -48,15 +84,15 @@ app.add_middleware(
 
 _rate_limiter = RateLimiter(RATE_LIMIT_PER_MINUTE)
 _job_slots = JobSlots(MAX_CONCURRENT_JOBS)
+_result_cache = ResultCache(_CACHE_ENTRIES, _CACHE_BYTES)
 
-
-@app.on_event("startup")
-def _warn_if_open_cors() -> None:
-    if "*" in ALLOWED_ORIGINS:
-        logger.warning(
-            "CORS is open to all origins. Set ALLOWED_ORIGINS to your frontend "
-            "origin (e.g. https://yourapp.lovable.app) before public launch."
-        )
+# Effective upload cap: env override (MB) or the pipeline's built-in default.
+# Keep this aligned with the storage bucket limit on the frontend (20 MB today)
+# so a file can't pass here and then fail the bucket upload.
+_env_upload_mb = os.getenv("MAX_UPLOAD_MB")
+EFFECTIVE_MAX_UPLOAD_BYTES = (
+    int(_env_upload_mb) * 1024 * 1024 if _env_upload_mb else MAX_UPLOAD_BYTES
+)
 
 
 def _build_config(
@@ -121,6 +157,25 @@ def _busy_response() -> HTTPException:
     )
 
 
+def _too_many_rows_response(row_count: int, limit: int) -> HTTPException:
+    return HTTPException(
+        status_code=413,
+        detail={
+            "error": {
+                "code": "TOO_MANY_ROWS",
+                "message": (
+                    f"This file has {row_count:,} rows; synchronous clustering is "
+                    f"capped at {limit:,} to keep response times fast. Split the "
+                    f"file into smaller batches, or contact support for large-batch "
+                    f"processing."
+                ),
+                "row_count": row_count,
+                "limit": limit,
+            }
+        },
+    )
+
+
 def build_cluster_response(pipeline: ClusterPipeline, df: pd.DataFrame) -> Dict[str, Any]:
     """Run the pipeline and assemble a strictly-JSON-safe response body.
 
@@ -139,8 +194,15 @@ def build_cluster_response(pipeline: ClusterPipeline, df: pd.DataFrame) -> Dict[
 
 
 @app.get("/health")
-def health() -> Dict[str, str]:
-    return {"status": "ok"}
+def health() -> Dict[str, Any]:
+    # Lightweight liveness + at-a-glance runtime stats (safe to expose: no data).
+    return {
+        "status": "ok",
+        "version": app.version,
+        "active_jobs": _job_slots.active,
+        "max_jobs": _job_slots.max_jobs,
+        "cache": _result_cache.stats(),
+    }
 
 
 @app.post("/preview")
@@ -161,7 +223,7 @@ async def preview_file(
     _enforce_rate_limit(request)
     try:
         payload = await read_upload_limited(
-            file, MAX_UPLOAD_BYTES, request.headers.get("content-length")
+            file, EFFECTIVE_MAX_UPLOAD_BYTES, request.headers.get("content-length")
         )
         pipeline = ClusterPipeline(
             _build_config(keyword_column, volume_column, difficulty_column, rank_column, url_column)
@@ -206,20 +268,59 @@ async def cluster_file(
     _enforce_rate_limit(request)
     try:
         payload = await read_upload_limited(
-            file, MAX_UPLOAD_BYTES, request.headers.get("content-length")
+            file, EFFECTIVE_MAX_UPLOAD_BYTES, request.headers.get("content-length")
         )
-        pipeline = ClusterPipeline(
-            _build_config(keyword_column, volume_column, difficulty_column, rank_column, url_column)
+        config = _build_config(
+            keyword_column, volume_column, difficulty_column, rank_column, url_column
         )
+        pipeline = ClusterPipeline(config)
+
+        # ---- Cache lookup ------------------------------------------------ #
+        # Deterministic pipeline (fixed random_state) => identical (file, mapping)
+        # always yields the same body. A hit returns instantly and spends no CPU.
+        cache_key = result_cache_key(
+            payload,
+            {
+                "keyword": keyword_column,
+                "volume": volume_column,
+                "difficulty": difficulty_column,
+                "position": rank_column,
+                "url": url_column,
+            },
+            {"engine_version": app.version, "backend": config.semantic_backend},
+        )
+        cached = _result_cache.get(cache_key)
+        if cached is not None:
+            logger.info("cache hit for cluster request (rows served from cache)")
+            return JSONResponse({**cached, "cached": True})
 
         def _run_job() -> Dict[str, Any]:
-            # The whole CPU-heavy path runs inside one threadpool worker and
-            # one job slot, so the event loop (and /health) stay responsive.
+            # The whole CPU-heavy path runs inside one threadpool worker and one
+            # job slot, so the event loop (and /health) stay responsive.
             with _job_slots.acquire():
                 df = pipeline.read_table(payload, file.filename or "upload")
-                return build_cluster_response(pipeline, df)
+
+                # Fast-fail oversized jobs BEFORE the expensive vectorize/cluster
+                # stages, so a huge file can't monopolise CPU or blow the request
+                # timeout. Return a clear, actionable 413 instead.
+                if HEAVY_JOB_ROW_LIMIT > 0 and len(df) > HEAVY_JOB_ROW_LIMIT:
+                    raise _too_many_rows_response(len(df), HEAVY_JOB_ROW_LIMIT)
+
+                started = time.monotonic()
+                body = build_cluster_response(pipeline, df)
+                elapsed_ms = int((time.monotonic() - started) * 1000)
+                body["timing_ms"] = elapsed_ms
+                body["cached"] = False
+                logger.info(
+                    "clustered %d rows -> %d clusters in %d ms",
+                    len(df),
+                    len(body.get("clusters", [])),
+                    elapsed_ms,
+                )
+                return body
 
         body = await run_in_threadpool(_run_job)
+        _result_cache.put(cache_key, body)
         return JSONResponse(body)
     except HTTPException:
         raise
