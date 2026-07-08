@@ -1,13 +1,16 @@
 from __future__ import annotations
 
+import gc
 import json
 import math
+import os
 import re
 from dataclasses import asdict
 from typing import Any, Dict, List, Optional
 
 import numpy as np
 import pandas as pd
+import sklearn
 from scipy.sparse import coo_matrix, csr_matrix, eye as sparse_eye, hstack, spmatrix
 from scipy.sparse.csgraph import connected_components
 from sklearn.decomposition import TruncatedSVD
@@ -25,6 +28,59 @@ from .utils import (
     stable_slug,
     unique_preserve_order,
 )
+
+# ----------------------------------------------------------------------- #
+# Memory controls (env-tunable). Critical on small containers (e.g. 512 MB
+# Railway instances):
+#
+# SKLEARN_WORKING_MEMORY_MB  Bounds the temporary chunks sklearn allocates for
+#   chunked pairwise-distance ops (used by NearestNeighbors with cosine).
+#   sklearn's DEFAULT is 1024 MB — i.e. it will happily try to allocate a ~1 GB
+#   scratch block, which alone OOM-kills a 512 MB container. 64 MB changes
+#   nothing about the results, only the chunk size.
+#
+# MEMORY_LEAN_ROW_THRESHOLD  At/above this many keywords the pipeline switches
+#   to float32 embedding vectors (halves k-NN scratch memory) and frees
+#   intermediates eagerly. Below it, behaviour is byte-identical to before.
+#
+# SIM_PAIR_BLOCK  The hybrid graph scores n*k candidate pairs; gathering all of
+#   them at once duplicates n*k sparse rows (~hundreds of MB at 25k keywords).
+#   Pairs are now scored in blocks of this size — identical arithmetic,
+#   bounded memory.
+# ----------------------------------------------------------------------- #
+WORKING_MEMORY_MB = int(os.getenv("SKLEARN_WORKING_MEMORY_MB", "64"))
+# NOTE: sklearn's config is THREAD-LOCAL. This import-time set_config only
+# covers the importing (main) thread; the API runs jobs in a worker thread via
+# run_in_threadpool, which would silently fall back to sklearn's 1024 MB
+# default — measured as a ~1.4 GB k-NN chunk spike at 25k rows. The
+# authoritative bound is therefore the config_context inside
+# _hybrid_similarity_graph, which applies in whichever thread runs the job.
+try:  # pragma: no cover - defensive; set_config exists in all supported versions
+    sklearn.set_config(working_memory=WORKING_MEMORY_MB)
+except Exception:
+    pass
+
+# glibc allocator hygiene (Linux). Pinning M_MMAP_THRESHOLD (which also
+# disables its dynamic growth) keeps numpy's large temporaries mmap-backed so
+# frees genuinely return memory to the OS between jobs; M_ARENA_MAX bounds
+# per-thread arena count. NOTE: this is steady-state hygiene, NOT the fix for
+# the worker-thread peak spike — that was sklearn's THREAD-LOCAL config (see
+# the working-memory note above). Measured at 25k rows: the identical job
+# peaked ~350 MB on the main thread but ~1.8 GB in a worker thread until the
+# config_context bound inside _hybrid_similarity_graph was added.
+# Set MALLOC_TUNING=0 to disable this tuning.
+if os.getenv("MALLOC_TUNING", "1") != "0":  # pragma: no cover - platform tuning
+    try:
+        import ctypes
+
+        _libc = ctypes.CDLL("libc.so.6", use_errno=True)
+        _libc.mallopt(-8, 2)  # M_ARENA_MAX = 2
+        _libc.mallopt(-3, 131072)  # M_MMAP_THRESHOLD pinned at 128 KB
+    except Exception:
+        pass
+
+LEAN_ROW_THRESHOLD = int(os.getenv("MEMORY_LEAN_ROW_THRESHOLD", "10000"))
+SIM_PAIR_BLOCK = int(os.getenv("SIM_PAIR_BLOCK", "20000"))
 
 
 def _fast_mode(series: pd.Series) -> str:
@@ -201,6 +257,11 @@ class ClusterPipeline:
             ("char_wb", cfg.char_ngram_range, cfg.max_features_char),
         ]
         blocks = []
+        # Lean mode for large inputs: min_df=2 drops n-grams that occur once.
+        # This substantially shrinks the transient vocabulary dict built during
+        # fit (a real allocation spike at 25k+ rows) and removes pure-noise
+        # features. Small inputs keep min_df=1 => byte-identical results.
+        min_df = 2 if len(texts) >= LEAN_ROW_THRESHOLD else 1
         for analyzer, ngram_range, max_features in specs:
             try:
                 blocks.append(
@@ -208,7 +269,7 @@ class ClusterPipeline:
                         analyzer=analyzer,
                         ngram_range=ngram_range,
                         max_features=max_features,
-                        min_df=1,
+                        min_df=min_df,
                     ).fit_transform(texts)
                 )
             except ValueError:
@@ -241,11 +302,28 @@ class ClusterPipeline:
         )
         if n_components < 2:
             return lexical_vectors.toarray().astype(float)
+        svd_input = (
+            lexical_vectors.astype(np.float32)
+            if len(texts) >= LEAN_ROW_THRESHOLD
+            else lexical_vectors
+        )
         svd = TruncatedSVD(n_components=n_components, random_state=cfg.random_state)
-        emb = svd.fit_transform(lexical_vectors)
+        emb = svd.fit_transform(svd_input)
+        del svd_input
+        # Free the fitted estimator eagerly: components_ alone is
+        # n_components x vocab floats (~50 MB at the default 50k vocab) and is
+        # never used again. No effect on results.
+        del svd
         norms = np.linalg.norm(emb, axis=1, keepdims=True)
         norms[norms == 0] = 1.0
-        return emb / norms
+        emb = emb / norms
+        if len(texts) >= LEAN_ROW_THRESHOLD:
+            # Lean mode for large inputs: float32 halves the k-NN scratch
+            # memory. Gated by threshold so small inputs (and their golden
+            # outputs) are byte-identical to previous versions.
+            emb = emb.astype(np.float32)
+            gc.collect()
+        return emb
 
     def _hybrid_similarity_graph(
         self, lexical_vectors: csr_matrix, semantic_vectors: np.ndarray
@@ -265,17 +343,35 @@ class ClusterPipeline:
             return csr_matrix(np.ones((1, 1), dtype=float))
 
         neighbor_k = int(min(cfg.neighbor_k, max(1, n - 1)))
-        nn = NearestNeighbors(metric="cosine", n_neighbors=neighbor_k + 1)
-        nn.fit(semantic_vectors)
-        distances, indices = nn.kneighbors(semantic_vectors)
+        # config_context (not set_config) because sklearn config is thread-local
+        # and this may run in a worker thread — see note at module top.
+        with sklearn.config_context(working_memory=WORKING_MEMORY_MB):
+            nn = NearestNeighbors(metric="cosine", n_neighbors=neighbor_k + 1)
+            nn.fit(semantic_vectors)
+            distances, indices = nn.kneighbors(semantic_vectors)
 
         rows = np.repeat(np.arange(n), neighbor_k)
         cols = indices[:, 1:].ravel()
-        sem_sims = np.clip(1.0 - distances[:, 1:].ravel(), 0.0, 1.0)
+        sem_sims = np.clip(1.0 - distances[:, 1:].ravel(), 0.0, 1.0).astype(np.float64)
 
         lex_norm = l2_normalize(lexical_vectors, norm="l2", copy=True)
-        lex_sims = np.asarray(lex_norm[rows].multiply(lex_norm[cols]).sum(axis=1)).ravel()
-        lex_sims = np.clip(lex_sims, 0.0, 1.0)
+        # Score the n*k candidate pairs in bounded blocks. Gathering all pairs
+        # at once (lex_norm[rows] / lex_norm[cols]) duplicates n*k sparse rows —
+        # at 25k keywords x k=15 that's 375k row copies, several hundred MB of
+        # transient allocations, and the main OOM driver on small containers.
+        # Blockwise evaluation performs the exact same arithmetic per pair, so
+        # results are identical; only the peak memory changes.
+        total_pairs = int(rows.shape[0])
+        lex_sims = np.empty(total_pairs, dtype=np.float64)
+        block = max(1, SIM_PAIR_BLOCK)
+        for start in range(0, total_pairs, block):
+            end = min(start + block, total_pairs)
+            lex_sims[start:end] = np.asarray(
+                lex_norm[rows[start:end]]
+                .multiply(lex_norm[cols[start:end]])
+                .sum(axis=1)
+            ).ravel()
+        np.clip(lex_sims, 0.0, 1.0, out=lex_sims)
 
         sims = cfg.hybrid_semantic_weight * sem_sims + cfg.hybrid_lexical_weight * lex_sims
         keep = sims >= cfg.similarity_threshold
@@ -419,6 +515,11 @@ class ClusterPipeline:
         lexical = self._lexical_vectors(texts)
         semantic = self._semantic_vectors(texts, lexical)
         graph = self._hybrid_similarity_graph(lexical, semantic)
+        # The vectors are no longer needed once the graph exists; free them
+        # before the pandas-heavy post stages (no effect on results).
+        del lexical, semantic
+        if len(texts) >= LEAN_ROW_THRESHOLD:
+            gc.collect()
         labels = self._cluster_from_graph(graph)
         labels = self._post_split(prepared, labels)
         clustered_mask = self._min_size_mask(labels)

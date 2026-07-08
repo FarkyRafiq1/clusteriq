@@ -51,7 +51,7 @@ RATE_LIMIT_PER_MINUTE = int(os.getenv("RATE_LIMIT_PER_MINUTE", "120"))
 MAX_CONCURRENT_JOBS = int(os.getenv("MAX_CONCURRENT_JOBS", "2"))
 HEAVY_JOB_ROW_LIMIT = int(os.getenv("HEAVY_JOB_ROW_LIMIT", "50000"))
 _CACHE_ENTRIES = int(os.getenv("CLUSTER_CACHE_SIZE", "64"))
-_CACHE_BYTES = int(os.getenv("CLUSTER_CACHE_MB", "128")) * 1024 * 1024
+_CACHE_BYTES = int(os.getenv("CLUSTER_CACHE_MB", "64")) * 1024 * 1024
 TRUST_PROXY_HEADERS = os.getenv("TRUST_PROXY_HEADERS", "1") != "0"
 
 
@@ -72,7 +72,7 @@ async def _lifespan(app: FastAPI):
     # Shutdown: nothing to clean up (in-process state is GC'd).
 
 
-app = FastAPI(title="ClusterIQ Engine", version="1.3.0", lifespan=_lifespan)
+app = FastAPI(title="ClusterIQ Engine", version="1.3.1", lifespan=_lifespan)
 
 app.add_middleware(
     CORSMiddleware,
