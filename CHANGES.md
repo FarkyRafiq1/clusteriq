@@ -1,3 +1,37 @@
+## v1.3.1 — memory fixes: 25k-keyword jobs no longer OOM small containers
+
+A real 25k-keyword clustering job OOM-killed a 512 MB Railway instance. Peak
+memory through the full API path, measured on a 1-vCPU box:
+
+| | peak RSS | time |
+|---|---|---|
+| v1.3.0 (crashed) | **2,324+ MB** | ~45 s |
+| algorithm fixes only | 631 MB | 34 s |
+| **v1.3.1 (final)** | **353 MB** | 31 s |
+| v1.3.1 @ 50k rows | 453 MB | 80 s |
+
+Cluster output identical across all runs (11,013 clusters at 25k).
+
+Root causes, in order of discovery:
+- **Candidate-pair gather** duplicated n*k sparse rows at once (~hundreds of MB
+  at 25k x k=15). Now scored in bounded blocks (`SIM_PAIR_BLOCK`, default
+  20,000) — identical arithmetic, bounded peak.
+- **Lean mode** for inputs >= `MEMORY_LEAN_ROW_THRESHOLD` (default 10,000):
+  float32 embeddings and SVD input, TF-IDF `min_df=2`, eager frees + gc.
+  Smaller inputs are byte-identical to previous versions.
+- **The headline bug:** sklearn's config is **thread-local**, so an import-time
+  `set_config(working_memory=...)` did not reach the worker thread the API runs
+  jobs in — which silently used sklearn's 1,024 MB default for k-NN distance
+  chunks (~1.4 GB spike, thread-only). The bound now lives in a
+  `config_context` inside `_hybrid_similarity_graph`, correct in any thread.
+- glibc mallopt hygiene (arena cap + pinned mmap threshold) keeps steady-state
+  RSS low between jobs; env-gated via `MALLOC_TUNING=0`.
+
+Also: `CLUSTER_CACHE_MB` default 128 -> 64; `railway.toml` now documents sized
+variable profiles for 512 MB / 1 GB / 2 GB instances; new
+`tests/test_memory_behaviour.py` locks in block-size result-identity and lean
+activation. Version bump also invalidates previously cached results.
+
 ## v1.3.0 — practical cost & throughput controls
 
 - **Result cache**: identical (file + column mapping) re-runs are served from an

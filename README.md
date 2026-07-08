@@ -142,8 +142,10 @@ Tunable via environment variables (see `railway.toml` for recommended values):
 | `MAX_CONCURRENT_JOBS` | 2 | Simultaneous clustering jobs; excess gets `503 SERVER_BUSY`. Size to CPU. |
 | `MAX_UPLOAD_MB` | 50 | Hard upload cap. **Keep in sync with the storage bucket (20 MB).** |
 | `HEAVY_JOB_ROW_LIMIT` | 50000 | Rows above which `/cluster` fast-fails with `413 TOO_MANY_ROWS` before the expensive stages. `0` = up to the pipeline's absolute `MAX_ROWS`. |
+| `SKLEARN_WORKING_MEMORY_MB` | 64 | Scratch-chunk bound for k-NN distance computation. Applied via `config_context` inside the job so it holds in worker threads (sklearn config is thread-local). |
+| `MEMORY_LEAN_ROW_THRESHOLD` | 10000 | Rows at/above which lean mode activates: float32 vectors, `min_df=2`, eager frees. Below it, results are byte-identical to earlier versions. |
 | `CLUSTER_CACHE_SIZE` | 64 | Cached result entries; identical re-runs are free. `0` disables. |
-| `CLUSTER_CACHE_MB` | 128 | Total cache byte budget. |
+| `CLUSTER_CACHE_MB` | 64 | Total cache byte budget. |
 | `ALLOWED_ORIGINS` | `*` | CORS allow-list (not load-bearing for the server-to-server call path, but set before public launch). |
 
 `/cluster` responses include `cached` (bool) and, on a fresh run, `timing_ms`.

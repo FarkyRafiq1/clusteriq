@@ -8,11 +8,33 @@ healthcheckTimeout = 120
 restartPolicyType = "ON_FAILURE"
 restartPolicyMaxRetries = 10
 
-# Recommended Railway Variables (set in the dashboard, not committed):
-#   ALLOWED_ORIGINS       = https://<your-frontend-domain>
-#   RATE_LIMIT_PER_MINUTE = 120        # shared across all users (one egress IP)
-#   MAX_CONCURRENT_JOBS   = 2          # size to the instance's CPU
-#   MAX_UPLOAD_MB         = 20         # keep in sync with the Supabase bucket
-#   HEAVY_JOB_ROW_LIMIT   = 50000      # fast-fail bigger files with a clear 413
-#   CLUSTER_CACHE_SIZE    = 64         # identical re-runs served from cache
-#   CLUSTER_CACHE_MB      = 128
+# ---------------------------------------------------------------------------
+# Recommended Railway Variables — SIZE THEM TO THE INSTANCE'S MEMORY.
+# A clustering job's peak memory scales with rows; these profiles keep peak
+# comfortably under the container limit. (The OOM at 25k rows on 512 MB was
+# caused by unbounded scratch allocations, fixed in v1.3.1 — but limits should
+# still match the box.)
+#
+# 512 MB instance:
+#   SKLEARN_WORKING_MEMORY_MB = 64
+#   MAX_CONCURRENT_JOBS       = 1        # two concurrent jobs double peak RAM
+#   HEAVY_JOB_ROW_LIMIT       = 25000
+#   CLUSTER_CACHE_MB          = 32
+#   MAX_UPLOAD_MB             = 20       # keep in sync with the storage bucket
+#
+# 1 GB instance:
+#   SKLEARN_WORKING_MEMORY_MB = 128
+#   MAX_CONCURRENT_JOBS       = 1..2
+#   HEAVY_JOB_ROW_LIMIT       = 50000
+#   CLUSTER_CACHE_MB          = 64
+#
+# 2 GB instance:
+#   SKLEARN_WORKING_MEMORY_MB = 256
+#   MAX_CONCURRENT_JOBS       = 2
+#   HEAVY_JOB_ROW_LIMIT       = 100000   # the pipeline's absolute MAX_ROWS
+#   CLUSTER_CACHE_MB          = 128
+#
+# Always:
+#   ALLOWED_ORIGINS           = https://<your-frontend-domain>
+#   RATE_LIMIT_PER_MINUTE     = 120      # shared across all users (one egress IP)
+# ---------------------------------------------------------------------------
