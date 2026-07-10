@@ -1,3 +1,40 @@
+## v1.4.0 — async clustering: POST /cluster always returns a job
+
+Fixes the 150 s Supabase edge-function wall clock killing long jobs: the engine
+computed results and threw them away because nothing was still listening.
+Submission now returns in <0.5 s regardless of file size.
+
+**New contract** (matches what cluster-proxy's poll/result/cancel actions
+already call):
+- `POST /cluster` -> `202 {"job_id": "...", "status": "queued"}` — always.
+  Upload validation (size cap, malformed file) still fails synchronously.
+- `GET /jobs/{id}` -> `{job_id, status, progress, stage, error_*}`;
+  404 `JOB_NOT_FOUND` for unknown ids (e.g. after an engine restart).
+- `GET /jobs/{id}/result` -> the exact pre-1.4 response body (clusters/rows/
+  summary/timing_ms/cached). 409 `JOB_NOT_READY` while running; 422 with the
+  job's error code on failure; 410 `RESULT_ALREADY_FETCHED` on re-fetch
+  (consume-once: the body is released after retrieval to protect the 512 MB
+  box — recovery path is the result cache: re-submit is instant).
+- `POST /jobs/{id}/cancel` and `DELETE /jobs/{id}` -> best-effort cancel.
+  Queued jobs cancel immediately; processing jobs stop at the next stage
+  boundary (sklearn C-code cannot be interrupted mid-call).
+
+**Behaviour changes to know about:**
+- `TOO_MANY_ROWS` is no longer a submission-time 413 — row count isn't known
+  until the file is parsed in the worker, so it surfaces as a *failed job*
+  with that code, which the poll loop already forwards to the frontend.
+- Cache hits return via the same async contract (a pre-completed job) so the
+  frontend polling path is uniform — no sync special case.
+- In-process job state does not survive engine restarts. Unknown ids 404 with
+  a recoverable message; the companion edge-function change marks the DB row
+  failed so the UI stops polling.
+
+Internals: new `clusteriq_engine/jobs.py` (thread-safe JobStore: TTL sweep,
+LRU-bounded, monotonic transitions, cooperative cancel). The sync-era
+`_job_slots` no longer gates workers (the bounded worker semaphore does);
+kept for /health visibility. Env knobs: `JOB_TTL_SECONDS`,
+`JOB_WORKER_THREADS`, `JOB_STORE_MAX`. 74 tests (17 new async-lifecycle).
+
 ## v1.3.1 — memory fixes: 25k-keyword jobs no longer OOM small containers
 
 A real 25k-keyword clustering job OOM-killed a 512 MB Railway instance. Peak

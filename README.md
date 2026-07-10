@@ -150,3 +150,25 @@ Tunable via environment variables (see `railway.toml` for recommended values):
 
 `/cluster` responses include `cached` (bool) and, on a fresh run, `timing_ms`.
 The clustering pipeline is deterministic (`random_state`), so caching is safe.
+
+
+## Async job API (v1.4.0)
+
+`POST /cluster` always returns immediately:
+
+```json
+202 {"job_id": "…", "status": "queued"}
+```
+
+Then poll and fetch:
+
+| Endpoint | Returns |
+|---|---|
+| `GET /jobs/{id}` | `{job_id, status, progress, stage, …}` — `queued/processing/completed/failed/canceled`; **404 `JOB_NOT_FOUND`** if the engine restarted since submission |
+| `GET /jobs/{id}/result` | the full clustering body (identical shape to the old sync response); 409 while running, 422 on failure, **410 after first fetch** (consume-once — re-submit is a cache hit if you need it again) |
+| `POST /jobs/{id}/cancel` / `DELETE /jobs/{id}` | best-effort cancel; processing jobs stop at the next stage boundary |
+
+Notes: `TOO_MANY_ROWS` now arrives as a failed job (row count is only known
+after parsing), not a submission-time 413. Job state is in-process and does
+not survive restarts — the cluster-proxy edge function marks the DB row failed
+when it sees the 404, so the UI shows "re-submit" rather than spinning.
