@@ -130,7 +130,9 @@ def test_endpoint_rate_limit_returns_429_with_retry_after(monkeypatch):
     payload = b"keyword,volume\nbest showers,100\nshower ideas,50\n"
     for _ in range(2):
         response = _call_cluster(_request(), UploadFile(io.BytesIO(payload), filename="a.csv"))
-        assert response.status_code == 200
+        # v1.4.0: submission returns 202 with a job_id, not 200 with results.
+        assert response.status_code == 202
+        assert "job_id" in json.loads(response.body)
     with pytest.raises(HTTPException) as err:
         _call_cluster(_request(), UploadFile(io.BytesIO(payload), filename="a.csv"))
     assert err.value.status_code == 429
@@ -138,16 +140,31 @@ def test_endpoint_rate_limit_returns_429_with_retry_after(monkeypatch):
     assert int(err.value.headers["Retry-After"]) >= 1
 
 
-def test_endpoint_returns_503_when_all_job_slots_busy(monkeypatch):
+def test_job_slots_no_longer_gate_async_workers(monkeypatch):
+    """v1.4.0 note: _job_slots was the sync-era admission control (fail-fast
+    503 for over-capacity requests). Under async, admission is queued via the
+    worker semaphore instead, so an occupied _job_slot does NOT cause worker
+    failure. This test locks in that expectation so nobody re-adds a
+    _job_slots.acquire() inside the worker."""
+    import time as _time
+    from clusteriq_engine.jobs import JobStore
     monkeypatch.setattr(api, "_rate_limiter", RateLimiter(0))
     monkeypatch.setattr(api, "_job_slots", JobSlots(1))
+    monkeypatch.setattr(api, "_job_store", JobStore(max_jobs=10, ttl_seconds=60))
     payload = b"keyword,volume\nbest showers,100\n"
-    with api._job_slots.acquire():  # simulate a job already running
-        with pytest.raises(HTTPException) as err:
-            _call_cluster(_request(), UploadFile(io.BytesIO(payload), filename="a.csv"))
-    assert err.value.status_code == 503
-    assert err.value.detail["error"]["code"] == "SERVER_BUSY"
-    assert err.value.headers["Retry-After"] == "30"
+    with api._job_slots.acquire():
+        submit = _call_cluster(_request(), UploadFile(io.BytesIO(payload), filename="a.csv"))
+        assert submit.status_code == 202
+        job_id = json.loads(submit.body)["job_id"]
+        deadline = _time.monotonic() + 5
+        while _time.monotonic() < deadline:
+            job = api._job_store.get(job_id)
+            if job and job.status.value in ("completed", "failed", "canceled"):
+                break
+            _time.sleep(0.02)
+        job = api._job_store.get(job_id)
+        # The worker completes successfully despite the "held" job slot.
+        assert job.status.value == "completed"
 
 
 def test_endpoint_rejects_oversized_declared_upload(monkeypatch):
@@ -161,11 +178,28 @@ def test_endpoint_rejects_oversized_declared_upload(monkeypatch):
 
 
 def test_endpoint_success_body_still_strict_json(monkeypatch):
+    import time as _time
+    from clusteriq_engine.jobs import JobStore
     monkeypatch.setattr(api, "_rate_limiter", RateLimiter(0))
+    monkeypatch.setattr(api, "_job_store", JobStore(max_jobs=10, ttl_seconds=60))
     payload = b"keyword,volume\nbest showers,\nshower ideas,50\n"  # missing volume
-    response = _call_cluster(_request(), UploadFile(io.BytesIO(payload), filename="a.csv"))
+    submit = _call_cluster(_request(), UploadFile(io.BytesIO(payload), filename="a.csv"))
+    assert submit.status_code == 202
+    job_id = json.loads(submit.body)["job_id"]
+    # Drive the job to completion via the in-process store (no HTTP client
+    # needed for this — we're calling api-layer functions directly).
+    deadline = _time.monotonic() + 10
+    while _time.monotonic() < deadline:
+        job = api._job_store.get(job_id)
+        if job and job.status.value in ("completed", "failed"):
+            break
+        _time.sleep(0.02)
+    body_dict = api._job_store.pop_result(job_id)
+    assert body_dict is not None, "job did not complete successfully"
+    # Round-trip through strict JSON — no bare NaN slipping in.
     body = json.loads(
-        response.body, parse_constant=lambda c: (_ for _ in ()).throw(ValueError(c))
+        json.dumps(body_dict),
+        parse_constant=lambda c: (_ for _ in ()).throw(ValueError(c)),
     )
     assert body["summary"]["keywords"] == 2
 
