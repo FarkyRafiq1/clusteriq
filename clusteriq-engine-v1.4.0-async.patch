@@ -1,0 +1,1267 @@
+diff --git a/CHANGES.md b/CHANGES.md
+index 3966fa1..3a598e4 100644
+--- a/CHANGES.md
++++ b/CHANGES.md
+@@ -1,3 +1,40 @@
++## v1.4.0 — async clustering: POST /cluster always returns a job
++
++Fixes the 150 s Supabase edge-function wall clock killing long jobs: the engine
++computed results and threw them away because nothing was still listening.
++Submission now returns in <0.5 s regardless of file size.
++
++**New contract** (matches what cluster-proxy's poll/result/cancel actions
++already call):
++- `POST /cluster` -> `202 {"job_id": "...", "status": "queued"}` — always.
++  Upload validation (size cap, malformed file) still fails synchronously.
++- `GET /jobs/{id}` -> `{job_id, status, progress, stage, error_*}`;
++  404 `JOB_NOT_FOUND` for unknown ids (e.g. after an engine restart).
++- `GET /jobs/{id}/result` -> the exact pre-1.4 response body (clusters/rows/
++  summary/timing_ms/cached). 409 `JOB_NOT_READY` while running; 422 with the
++  job's error code on failure; 410 `RESULT_ALREADY_FETCHED` on re-fetch
++  (consume-once: the body is released after retrieval to protect the 512 MB
++  box — recovery path is the result cache: re-submit is instant).
++- `POST /jobs/{id}/cancel` and `DELETE /jobs/{id}` -> best-effort cancel.
++  Queued jobs cancel immediately; processing jobs stop at the next stage
++  boundary (sklearn C-code cannot be interrupted mid-call).
++
++**Behaviour changes to know about:**
++- `TOO_MANY_ROWS` is no longer a submission-time 413 — row count isn't known
++  until the file is parsed in the worker, so it surfaces as a *failed job*
++  with that code, which the poll loop already forwards to the frontend.
++- Cache hits return via the same async contract (a pre-completed job) so the
++  frontend polling path is uniform — no sync special case.
++- In-process job state does not survive engine restarts. Unknown ids 404 with
++  a recoverable message; the companion edge-function change marks the DB row
++  failed so the UI stops polling.
++
++Internals: new `clusteriq_engine/jobs.py` (thread-safe JobStore: TTL sweep,
++LRU-bounded, monotonic transitions, cooperative cancel). The sync-era
++`_job_slots` no longer gates workers (the bounded worker semaphore does);
++kept for /health visibility. Env knobs: `JOB_TTL_SECONDS`,
++`JOB_WORKER_THREADS`, `JOB_STORE_MAX`. 74 tests (17 new async-lifecycle).
++
+ ## v1.3.1 — memory fixes: 25k-keyword jobs no longer OOM small containers
+ 
+ A real 25k-keyword clustering job OOM-killed a 512 MB Railway instance. Peak
+diff --git a/README.md b/README.md
+index f9251d5..1a3c83a 100644
+--- a/README.md
++++ b/README.md
+@@ -150,3 +150,25 @@ Tunable via environment variables (see `railway.toml` for recommended values):
+ 
+ `/cluster` responses include `cached` (bool) and, on a fresh run, `timing_ms`.
+ The clustering pipeline is deterministic (`random_state`), so caching is safe.
++
++
++## Async job API (v1.4.0)
++
++`POST /cluster` always returns immediately:
++
++```json
++202 {"job_id": "…", "status": "queued"}
++```
++
++Then poll and fetch:
++
++| Endpoint | Returns |
++|---|---|
++| `GET /jobs/{id}` | `{job_id, status, progress, stage, …}` — `queued/processing/completed/failed/canceled`; **404 `JOB_NOT_FOUND`** if the engine restarted since submission |
++| `GET /jobs/{id}/result` | the full clustering body (identical shape to the old sync response); 409 while running, 422 on failure, **410 after first fetch** (consume-once — re-submit is a cache hit if you need it again) |
++| `POST /jobs/{id}/cancel` / `DELETE /jobs/{id}` | best-effort cancel; processing jobs stop at the next stage boundary |
++
++Notes: `TOO_MANY_ROWS` now arrives as a failed job (row count is only known
++after parsing), not a submission-time 413. Job state is in-process and does
++not survive restarts — the cluster-proxy edge function marks the DB row failed
++when it sees the 404, so the UI shows "re-submit" rather than spinning.
+diff --git a/clusteriq_engine/api.py b/clusteriq_engine/api.py
+index 73d66ea..81ce316 100644
+--- a/clusteriq_engine/api.py
++++ b/clusteriq_engine/api.py
+@@ -1,7 +1,9 @@
+ from __future__ import annotations
+ 
++import asyncio
+ import logging
+ import os
++import threading
+ import time
+ import uuid
+ from contextlib import asynccontextmanager
+@@ -17,6 +19,7 @@ from .cache import ResultCache, result_cache_key
+ from .errors import UserError
+ from .hardening import JobSlots, RateLimiter, ServerBusy, client_ip, read_upload_limited
+ from .ingest import MAX_UPLOAD_BYTES, resolve_columns
++from .jobs import CanceledError, JobStatus, JobStore
+ from .pipeline import ClusterPipeline
+ from .schemas import PipelineConfig
+ from .utils import df_records_json_safe
+@@ -72,7 +75,7 @@ async def _lifespan(app: FastAPI):
+     # Shutdown: nothing to clean up (in-process state is GC'd).
+ 
+ 
+-app = FastAPI(title="ClusterIQ Engine", version="1.3.1", lifespan=_lifespan)
++app = FastAPI(title="ClusterIQ Engine", version="1.4.0", lifespan=_lifespan)
+ 
+ app.add_middleware(
+     CORSMiddleware,
+@@ -86,6 +89,21 @@ _rate_limiter = RateLimiter(RATE_LIMIT_PER_MINUTE)
+ _job_slots = JobSlots(MAX_CONCURRENT_JOBS)
+ _result_cache = ResultCache(_CACHE_ENTRIES, _CACHE_BYTES)
+ 
++# ---- Async job store ---------------------------------------------------- #
++# JOB_STORE_MAX          Max concurrent tracked jobs (mostly terminal, TTL-swept).
++# JOB_TTL_SECONDS        How long completed/failed job records survive.
++# JOB_WORKER_THREADS     Concurrent background workers. Kept in lockstep with
++#                        MAX_CONCURRENT_JOBS by default so admission control
++#                        (job slots) remains the single throttle.
++_JOB_STORE_MAX = int(os.getenv("JOB_STORE_MAX", "1000"))
++_JOB_TTL_SECONDS = int(os.getenv("JOB_TTL_SECONDS", "3600"))
++_JOB_WORKER_THREADS = int(os.getenv("JOB_WORKER_THREADS", str(max(1, MAX_CONCURRENT_JOBS))))
++
++_job_store = JobStore(max_jobs=_JOB_STORE_MAX, ttl_seconds=_JOB_TTL_SECONDS)
++# Bounded worker pool: separate from FastAPI's default threadpool so background
++# clustering can't starve the request-serving path (uploads, polls, health).
++_job_executor_semaphore = threading.BoundedSemaphore(_JOB_WORKER_THREADS)
++
+ # Effective upload cap: env override (MB) or the pipeline's built-in default.
+ # Keep this aligned with the storage bucket limit on the frontend (20 MB today)
+ # so a file can't pass here and then fail the bucket upload.
+@@ -202,6 +220,7 @@ def health() -> Dict[str, Any]:
+         "active_jobs": _job_slots.active,
+         "max_jobs": _job_slots.max_jobs,
+         "cache": _result_cache.stats(),
++        "jobs": _job_store.stats(),
+     }
+ 
+ 
+@@ -265,68 +284,266 @@ async def cluster_file(
+     rank_column: Optional[str] = Form("position"),
+     url_column: Optional[str] = Form("url"),
+ ) -> JSONResponse:
++    """Submit a clustering job for asynchronous processing.
++
++    Always returns immediately with `{"job_id": "...", "status": "queued"}`.
++    The actual pipeline runs in a background thread; poll `GET /jobs/{id}`
++    for status and `GET /jobs/{id}/result` for the completed body.
++
++    Rationale: synchronous responses were killed by the Supabase edge function's
++    150s wall clock even when clustering succeeded on the engine — the result
++    was computed and then thrown away because nothing was still listening.
++    Making submission async decouples "clustering finished" from "HTTP request
++    still alive," so no work is lost to network/proxy timeouts.
++
++    Note: job state lives in-process. On Railway container restart, in-flight
++    jobs are lost — the poll endpoint returns 404 for their ids, which the
++    edge function surfaces to the frontend as a clear failure the user can
++    retry (rather than a spinner that hangs forever).
++    """
+     _enforce_rate_limit(request)
+     try:
++        # Read the upload BEFORE returning: if the file is malformed or over the
++        # size cap, we surface the error synchronously (400/413) rather than
++        # queuing a job that will fail two seconds later. Upload read is fast
++        # and cheap; the expensive work is downstream.
+         payload = await read_upload_limited(
+             file, EFFECTIVE_MAX_UPLOAD_BYTES, request.headers.get("content-length")
+         )
+         config = _build_config(
+             keyword_column, volume_column, difficulty_column, rank_column, url_column
+         )
+-        pipeline = ClusterPipeline(config)
+-
+-        # ---- Cache lookup ------------------------------------------------ #
+-        # Deterministic pipeline (fixed random_state) => identical (file, mapping)
+-        # always yields the same body. A hit returns instantly and spends no CPU.
++        column_mapping = {
++            "keyword": keyword_column,
++            "volume": volume_column,
++            "difficulty": difficulty_column,
++            "position": rank_column,
++            "url": url_column,
++        }
++
++        # Cache lookup happens synchronously: a repeat run is free, so it would
++        # be silly to make the caller poll for something we can hand back now.
++        # We still route the response through the async contract (create a
++        # completed job, return job_id) so the frontend's polling code path is
++        # exercised uniformly — no special sync case for the edge function.
+         cache_key = result_cache_key(
+             payload,
+-            {
+-                "keyword": keyword_column,
+-                "volume": volume_column,
+-                "difficulty": difficulty_column,
+-                "position": rank_column,
+-                "url": url_column,
+-            },
++            column_mapping,
+             {"engine_version": app.version, "backend": config.semantic_backend},
+         )
+         cached = _result_cache.get(cache_key)
+         if cached is not None:
+-            logger.info("cache hit for cluster request (rows served from cache)")
+-            return JSONResponse({**cached, "cached": True})
+-
+-        def _run_job() -> Dict[str, Any]:
+-            # The whole CPU-heavy path runs inside one threadpool worker and one
+-            # job slot, so the event loop (and /health) stay responsive.
+-            with _job_slots.acquire():
+-                df = pipeline.read_table(payload, file.filename or "upload")
+-
+-                # Fast-fail oversized jobs BEFORE the expensive vectorize/cluster
+-                # stages, so a huge file can't monopolise CPU or blow the request
+-                # timeout. Return a clear, actionable 413 instead.
+-                if HEAVY_JOB_ROW_LIMIT > 0 and len(df) > HEAVY_JOB_ROW_LIMIT:
+-                    raise _too_many_rows_response(len(df), HEAVY_JOB_ROW_LIMIT)
+-
+-                started = time.monotonic()
+-                body = build_cluster_response(pipeline, df)
+-                elapsed_ms = int((time.monotonic() - started) * 1000)
+-                body["timing_ms"] = elapsed_ms
+-                body["cached"] = False
+-                logger.info(
+-                    "clustered %d rows -> %d clusters in %d ms",
+-                    len(df),
+-                    len(body.get("clusters", [])),
+-                    elapsed_ms,
+-                )
+-                return body
++            job = _job_store.create()
++            cached_body = {**cached, "cached": True}
++            _job_store.mark_processing(job.id, stage="cache")
++            _job_store.mark_completed(job.id, cached_body)
++            logger.info("cache hit — job %s returned immediately", job.id)
++            return JSONResponse(
++                {"job_id": job.id, "status": "queued", "cached": True},
++                status_code=202,
++            )
++
++        # Create the job record BEFORE launching the worker so a poll racing
++        # the response can always find the id.
++        job = _job_store.create()
++        filename = file.filename or "upload"
++
++        # Fire-and-forget the background worker. We deliberately don't use
++        # BackgroundTasks here — it runs after the response is sent, which is
++        # fine, but tying the worker to the request lifecycle makes cleanup
++        # semantics fuzzy. A plain thread with the store as its comms channel
++        # is simpler to reason about and to test.
++        loop = asyncio.get_running_loop()
++        loop.run_in_executor(
++            None,
++            _run_clustering_job,
++            job.id, payload, filename, config, column_mapping, cache_key,
++        )
+ 
+-        body = await run_in_threadpool(_run_job)
+-        _result_cache.put(cache_key, body)
+-        return JSONResponse(body)
++        return JSONResponse(
++            {"job_id": job.id, "status": "queued"},
++            status_code=202,
++        )
+     except HTTPException:
+         raise
+-    except ServerBusy:
+-        raise _busy_response() from None
+     except UserError as exc:
+         raise _user_error_response(exc) from exc
+     except Exception as exc:  # noqa: BLE001 - boundary handler
+         raise _internal_error_response(exc) from exc
++
++
++def _run_clustering_job(
++    job_id: str,
++    payload: bytes,
++    filename: str,
++    config: PipelineConfig,
++    column_mapping: Dict[str, Optional[str]],
++    cache_key: str,
++) -> None:
++    """Runs in a background thread. Marshals the pipeline through the JobStore.
++
++    Cooperative cancellation: we check `is_cancel_requested` between stages.
++    Once we've entered the CPU-bound C code (SVD, k-NN) we can't interrupt —
++    this is the honest semantic. Users see "canceled" as soon as the current
++    stage finishes.
++    """
++    # Bounded worker slot: prevents unbounded concurrency separately from the
++    # request-serving pool. Blocks briefly if we're at capacity — acceptable,
++    # since the job is already queued from the caller's perspective.
++    with _job_executor_semaphore:
++        pipeline = ClusterPipeline(config)
++        try:
++            if _job_store.is_cancel_requested(job_id):
++                raise CanceledError()
++            _job_store.mark_processing(job_id, stage="reading")
++
++            df = pipeline.read_table(payload, filename)
++            # Fast-fail oversized jobs BEFORE the expensive vectorize/
++            # cluster stages, so a huge file can't hog CPU forever.
++            if HEAVY_JOB_ROW_LIMIT > 0 and len(df) > HEAVY_JOB_ROW_LIMIT:
++                _job_store.mark_failed(
++                    job_id,
++                    code="TOO_MANY_ROWS",
++                    message=(
++                        f"This file has {len(df):,} rows; synchronous "
++                        f"clustering is capped at {HEAVY_JOB_ROW_LIMIT:,} "
++                        f"to keep response times fast. Split the file "
++                        f"into smaller batches, or contact support for "
++                        f"large-batch processing."
++                    ),
++                )
++                return
++
++            _job_store.update_progress(job_id, 25, "vectorizing")
++            if _job_store.is_cancel_requested(job_id):
++                raise CanceledError()
++
++            started = time.monotonic()
++            body = build_cluster_response(pipeline, df)
++            elapsed_ms = int((time.monotonic() - started) * 1000)
++            body["timing_ms"] = elapsed_ms
++            body["cached"] = False
++
++            if _job_store.is_cancel_requested(job_id):
++                raise CanceledError()
++
++            _result_cache.put(cache_key, body)
++            _job_store.mark_completed(job_id, body)
++            logger.info(
++                "job %s clustered %d rows -> %d clusters in %d ms",
++                job_id, len(df), len(body.get("clusters", [])), elapsed_ms,
++            )
++        except CanceledError:
++            _job_store.mark_failed(job_id, code="CANCELED", message="Canceled by user")
++            logger.info("job %s canceled", job_id)
++        except UserError as exc:
++            _job_store.mark_failed(job_id, code=exc.code, message=str(exc))
++            logger.info("job %s failed with user error %s: %s", job_id, exc.code, exc)
++        except Exception as exc:  # noqa: BLE001 - worker boundary
++            logger.exception("job %s failed unexpectedly", job_id)
++            _job_store.mark_failed(job_id, code="INTERNAL_ERROR", message=str(exc) or "Clustering failed")
++
++
++# =========================================================================== #
++# Job status / result / cancel — the endpoints the cluster-proxy edge function
++# calls. Contract locked to what supabase/functions/cluster-proxy/index.ts
++# expects on `poll`, `result`, and `cancel` actions.
++# =========================================================================== #
++
++@app.get("/jobs/{job_id}")
++def get_job_status(job_id: str) -> JSONResponse:
++    """Return current job status. Body shape matches what the edge function's
++    `poll` handler feeds to the frontend."""
++    job = _job_store.get(job_id)
++    if job is None:
++        # Distinct 404 code so the edge function can surface "job was lost —
++        # please retry" instead of leaving the frontend polling forever.
++        raise HTTPException(
++            status_code=404,
++            detail={
++                "error": {
++                    "code": "JOB_NOT_FOUND",
++                    "message": (
++                        "Job not found. This can happen if the server "
++                        "restarted while the job was in flight. Please "
++                        "re-submit the file."
++                    ),
++                }
++            },
++        )
++    return JSONResponse(job.snapshot())
++
++
++@app.get("/jobs/{job_id}/result")
++def get_job_result(job_id: str) -> JSONResponse:
++    """Return the completed clustering body. Same shape as the pre-async
++    `POST /cluster` response, so `persistResults` in the edge function needs
++    no changes."""
++    job = _job_store.get(job_id)
++    if job is None:
++        raise HTTPException(
++            status_code=404,
++            detail={"error": {"code": "JOB_NOT_FOUND", "message": "Job not found."}},
++        )
++    if job.status is JobStatus.PROCESSING or job.status is JobStatus.QUEUED:
++        raise HTTPException(
++            status_code=409,
++            detail={
++                "error": {
++                    "code": "JOB_NOT_READY",
++                    "message": f"Job is still {job.status.value}.",
++                    "status": job.status.value,
++                    "progress": job.progress,
++                }
++            },
++        )
++    if job.status is JobStatus.FAILED or job.status is JobStatus.CANCELED:
++        raise HTTPException(
++            status_code=422,
++            detail={
++                "error": {
++                    "code": job.error_code or "JOB_FAILED",
++                    "message": job.error_message or "Job failed.",
++                    "status": job.status.value,
++                }
++            },
++        )
++    # COMPLETED. pop_result gives us consume-once semantics so the (potentially
++    # large) result payload is released after retrieval — the job record stays
++    # so subsequent polls still 200 with status=completed, they just can't
++    # re-fetch the body. The edge function only fetches it once anyway
++    # (persistResults writes to the DB, then it's the source of truth).
++    body = _job_store.pop_result(job_id)
++    if body is None:
++        # Already consumed. Fall back to a minimal completed marker so callers
++        # can still see "completed" even if they retried the fetch.
++        raise HTTPException(
++            status_code=410,
++            detail={
++                "error": {
++                    "code": "RESULT_ALREADY_FETCHED",
++                    "message": "This job's result has already been retrieved.",
++                }
++            },
++        )
++    return JSONResponse(body)
++
++
++@app.post("/jobs/{job_id}/cancel")
++@app.delete("/jobs/{job_id}")
++def cancel_job(job_id: str) -> JSONResponse:
++    """Best-effort cancel. Queued jobs cancel immediately; processing jobs stop
++    at the next stage boundary (cannot interrupt sklearn C-code mid-call).
++    The edge function tries DELETE first, then POST /cancel — both are wired
++    to the same handler."""
++    ok = _job_store.request_cancel(job_id)
++    if not ok:
++        job = _job_store.get(job_id)
++        if job is None:
++            raise HTTPException(
++                status_code=404,
++                detail={"error": {"code": "JOB_NOT_FOUND", "message": "Job not found."}},
++            )
++        # Already terminal — idempotent success.
++        return JSONResponse({"canceled": False, "status": job.status.value})
++    return JSONResponse({"canceled": True})
+diff --git a/clusteriq_engine/jobs.py b/clusteriq_engine/jobs.py
+new file mode 100644
+index 0000000..528d3ba
+--- /dev/null
++++ b/clusteriq_engine/jobs.py
+@@ -0,0 +1,241 @@
++"""In-process async job store for clustering.
++
++Design goals, in order:
++
++1. **Correctness first.** State transitions are protected by a lock and are
++   monotonic (queued -> processing -> completed/failed/canceled; no going back).
++   A caller polling `get()` always sees a consistent snapshot.
++
++2. **Bounded memory.** Two ceilings prevent a leak: `max_jobs` caps live entries
++   (LRU eviction of terminal jobs first), and `ttl_seconds` sweeps completed
++   jobs older than the retention window. A completed job's *result* is kept in
++   the entry until fetched or expired.
++
++3. **Honest cancellation.** Cancel sets a flag the worker checks between
++   pipeline stages. The pipeline itself is sklearn C-code inside numpy — we
++   cannot interrupt it mid-SVD. So cancel is "stops at the next checkpoint,"
++   which is the honest semantic and matches what the frontend already tolerates
++   (edge function marks canceled DB-side regardless).
++
++4. **Restart-safe FAILURE, not restart-safe SUCCESS.** In-process state dies
++   on Railway restart. That's a genuine limitation of option A (see the
++   changelog). What we DO get: the poll endpoint returns 404 for unknown ids,
++   which the edge function surfaces to the frontend as a clear failure the
++   user can retry — rather than a spinner that hangs forever.
++"""
++from __future__ import annotations
++
++import logging
++import threading
++import time
++import uuid
++from dataclasses import dataclass, field
++from enum import Enum
++from typing import Any, Callable, Dict, Optional
++
++logger = logging.getLogger("clusteriq.jobs")
++
++
++class JobStatus(str, Enum):
++    QUEUED = "queued"
++    PROCESSING = "processing"
++    COMPLETED = "completed"
++    FAILED = "failed"
++    CANCELED = "canceled"
++
++
++TERMINAL = {JobStatus.COMPLETED, JobStatus.FAILED, JobStatus.CANCELED}
++
++
++@dataclass
++class Job:
++    id: str
++    status: JobStatus = JobStatus.QUEUED
++    progress: int = 0
++    stage: str = "queued"
++    created_at: float = field(default_factory=time.time)
++    started_at: Optional[float] = None
++    completed_at: Optional[float] = None
++    row_count: Optional[int] = None
++    error_code: Optional[str] = None
++    error_message: Optional[str] = None
++    result: Optional[Dict[str, Any]] = None
++    # A cooperative-cancel flag the worker checks between pipeline stages.
++    # Not a preemptive interrupt: sklearn C-code can't be killed mid-call.
++    _cancel_requested: bool = False
++
++    def snapshot(self) -> Dict[str, Any]:
++        """Return the JSON body the edge function's `poll` handler expects."""
++        body: Dict[str, Any] = {
++            "job_id": self.id,
++            "status": self.status.value,
++            "progress": self.progress,
++            "stage": self.stage,
++        }
++        if self.row_count is not None:
++            body["row_count"] = self.row_count
++        if self.started_at is not None:
++            body["started_at"] = self.started_at
++        if self.completed_at is not None:
++            body["completed_at"] = self.completed_at
++        if self.error_message:
++            body["error_message"] = self.error_message
++        if self.error_code:
++            body["error_code"] = self.error_code
++        return body
++
++
++class JobStore:
++    """Thread-safe, bounded, TTL-swept in-process job store."""
++
++    def __init__(self, max_jobs: int = 1000, ttl_seconds: int = 3600):
++        self._jobs: Dict[str, Job] = {}
++        self._lock = threading.RLock()
++        self.max_jobs = int(max_jobs)
++        self.ttl_seconds = int(ttl_seconds)
++
++    # ---- create / read -------------------------------------------------- #
++
++    def create(self, row_count: Optional[int] = None) -> Job:
++        with self._lock:
++            self._sweep_locked()
++            job_id = uuid.uuid4().hex
++            job = Job(id=job_id, row_count=row_count)
++            self._jobs[job_id] = job
++            self._evict_if_over_locked()
++            return job
++
++    def get(self, job_id: str) -> Optional[Job]:
++        with self._lock:
++            self._sweep_locked()
++            return self._jobs.get(job_id)
++
++    def pop_result(self, job_id: str) -> Optional[Dict[str, Any]]:
++        """Consume-once semantics for successful results: free the memory
++        once the caller has retrieved it. The job entry stays (in COMPLETED)
++        so subsequent polls still 200, but the (potentially large) `result`
++        payload is released."""
++        with self._lock:
++            job = self._jobs.get(job_id)
++            if not job or job.status is not JobStatus.COMPLETED or job.result is None:
++                return None
++            result, job.result = job.result, None
++            return result
++
++    # ---- mutate --------------------------------------------------------- #
++
++    def mark_processing(self, job_id: str, stage: str = "loading") -> Optional[Job]:
++        with self._lock:
++            job = self._jobs.get(job_id)
++            if job is None or job.status is not JobStatus.QUEUED:
++                return None
++            job.status = JobStatus.PROCESSING
++            job.stage = stage
++            job.progress = 5
++            job.started_at = time.time()
++            return job
++
++    def update_progress(self, job_id: str, progress: int, stage: str) -> None:
++        with self._lock:
++            job = self._jobs.get(job_id)
++            if job is None or job.status is not JobStatus.PROCESSING:
++                return
++            # Progress is monotonic — never regress.
++            if progress > job.progress:
++                job.progress = min(progress, 99)
++            job.stage = stage
++
++    def mark_completed(self, job_id: str, result: Dict[str, Any]) -> None:
++        with self._lock:
++            job = self._jobs.get(job_id)
++            if job is None or job.status in TERMINAL:
++                return  # canceled or already terminal
++            job.status = JobStatus.COMPLETED
++            job.progress = 100
++            job.stage = "completed"
++            job.completed_at = time.time()
++            job.result = result
++
++    def mark_failed(self, job_id: str, code: str, message: str) -> None:
++        with self._lock:
++            job = self._jobs.get(job_id)
++            if job is None or job.status in TERMINAL:
++                return
++            job.status = JobStatus.FAILED
++            job.completed_at = time.time()
++            job.stage = "failed"
++            job.error_code = code
++            job.error_message = message
++
++    def request_cancel(self, job_id: str) -> bool:
++        """Return True if a cancel was queued for a live job. Idempotent."""
++        with self._lock:
++            job = self._jobs.get(job_id)
++            if job is None:
++                return False
++            if job.status in TERMINAL:
++                return False
++            job._cancel_requested = True
++            if job.status is JobStatus.QUEUED:
++                # Queued jobs can be canceled immediately; the worker hasn't
++                # picked them up. Processing jobs will finish their current
++                # stage (see `_check_canceled` in the runner).
++                job.status = JobStatus.CANCELED
++                job.completed_at = time.time()
++                job.stage = "canceled"
++                job.error_message = "Canceled by user"
++            return True
++
++    def is_cancel_requested(self, job_id: str) -> bool:
++        with self._lock:
++            job = self._jobs.get(job_id)
++            return bool(job and job._cancel_requested)
++
++    # ---- housekeeping --------------------------------------------------- #
++
++    def _sweep_locked(self) -> None:
++        """Remove terminal jobs older than TTL. Called on every read/write —
++        cheap because the dict is small and we only compare timestamps."""
++        if not self._jobs:
++            return
++        cutoff = time.time() - self.ttl_seconds
++        expired = [
++            jid for jid, j in self._jobs.items()
++            if j.status in TERMINAL and (j.completed_at or 0) < cutoff
++        ]
++        for jid in expired:
++            self._jobs.pop(jid, None)
++        if expired:
++            logger.debug("swept %d expired jobs", len(expired))
++
++    def _evict_if_over_locked(self) -> None:
++        """If we're past max_jobs, evict oldest terminal entries first, then
++        the oldest queued (should never happen in practice — max_jobs is high)."""
++        if len(self._jobs) <= self.max_jobs:
++            return
++        # Prefer to drop terminal jobs; only touch live ones as a last resort.
++        by_priority = sorted(
++            self._jobs.values(),
++            key=lambda j: (j.status not in TERMINAL, j.created_at),
++        )
++        to_drop = len(self._jobs) - self.max_jobs
++        for j in by_priority[:to_drop]:
++            self._jobs.pop(j.id, None)
++
++    def stats(self) -> Dict[str, Any]:
++        with self._lock:
++            self._sweep_locked()
++            by_status: Dict[str, int] = {}
++            for j in self._jobs.values():
++                by_status[j.status.value] = by_status.get(j.status.value, 0) + 1
++            return {
++                "total": len(self._jobs),
++                "by_status": by_status,
++                "max_jobs": self.max_jobs,
++                "ttl_seconds": self.ttl_seconds,
++            }
++
++
++class CanceledError(Exception):
++    """Raised inside a job runner when the caller requested cancellation."""
++    pass
+diff --git a/clusteriq_engine/tests/test_api_hardening.py b/clusteriq_engine/tests/test_api_hardening.py
+index 8f7bee5..f3e65dd 100644
+--- a/clusteriq_engine/tests/test_api_hardening.py
++++ b/clusteriq_engine/tests/test_api_hardening.py
+@@ -130,7 +130,9 @@ def test_endpoint_rate_limit_returns_429_with_retry_after(monkeypatch):
+     payload = b"keyword,volume\nbest showers,100\nshower ideas,50\n"
+     for _ in range(2):
+         response = _call_cluster(_request(), UploadFile(io.BytesIO(payload), filename="a.csv"))
+-        assert response.status_code == 200
++        # v1.4.0: submission returns 202 with a job_id, not 200 with results.
++        assert response.status_code == 202
++        assert "job_id" in json.loads(response.body)
+     with pytest.raises(HTTPException) as err:
+         _call_cluster(_request(), UploadFile(io.BytesIO(payload), filename="a.csv"))
+     assert err.value.status_code == 429
+@@ -138,16 +140,31 @@ def test_endpoint_rate_limit_returns_429_with_retry_after(monkeypatch):
+     assert int(err.value.headers["Retry-After"]) >= 1
+ 
+ 
+-def test_endpoint_returns_503_when_all_job_slots_busy(monkeypatch):
++def test_job_slots_no_longer_gate_async_workers(monkeypatch):
++    """v1.4.0 note: _job_slots was the sync-era admission control (fail-fast
++    503 for over-capacity requests). Under async, admission is queued via the
++    worker semaphore instead, so an occupied _job_slot does NOT cause worker
++    failure. This test locks in that expectation so nobody re-adds a
++    _job_slots.acquire() inside the worker."""
++    import time as _time
++    from clusteriq_engine.jobs import JobStore
+     monkeypatch.setattr(api, "_rate_limiter", RateLimiter(0))
+     monkeypatch.setattr(api, "_job_slots", JobSlots(1))
++    monkeypatch.setattr(api, "_job_store", JobStore(max_jobs=10, ttl_seconds=60))
+     payload = b"keyword,volume\nbest showers,100\n"
+-    with api._job_slots.acquire():  # simulate a job already running
+-        with pytest.raises(HTTPException) as err:
+-            _call_cluster(_request(), UploadFile(io.BytesIO(payload), filename="a.csv"))
+-    assert err.value.status_code == 503
+-    assert err.value.detail["error"]["code"] == "SERVER_BUSY"
+-    assert err.value.headers["Retry-After"] == "30"
++    with api._job_slots.acquire():
++        submit = _call_cluster(_request(), UploadFile(io.BytesIO(payload), filename="a.csv"))
++        assert submit.status_code == 202
++        job_id = json.loads(submit.body)["job_id"]
++        deadline = _time.monotonic() + 5
++        while _time.monotonic() < deadline:
++            job = api._job_store.get(job_id)
++            if job and job.status.value in ("completed", "failed", "canceled"):
++                break
++            _time.sleep(0.02)
++        job = api._job_store.get(job_id)
++        # The worker completes successfully despite the "held" job slot.
++        assert job.status.value == "completed"
+ 
+ 
+ def test_endpoint_rejects_oversized_declared_upload(monkeypatch):
+@@ -161,11 +178,28 @@ def test_endpoint_rejects_oversized_declared_upload(monkeypatch):
+ 
+ 
+ def test_endpoint_success_body_still_strict_json(monkeypatch):
++    import time as _time
++    from clusteriq_engine.jobs import JobStore
+     monkeypatch.setattr(api, "_rate_limiter", RateLimiter(0))
++    monkeypatch.setattr(api, "_job_store", JobStore(max_jobs=10, ttl_seconds=60))
+     payload = b"keyword,volume\nbest showers,\nshower ideas,50\n"  # missing volume
+-    response = _call_cluster(_request(), UploadFile(io.BytesIO(payload), filename="a.csv"))
++    submit = _call_cluster(_request(), UploadFile(io.BytesIO(payload), filename="a.csv"))
++    assert submit.status_code == 202
++    job_id = json.loads(submit.body)["job_id"]
++    # Drive the job to completion via the in-process store (no HTTP client
++    # needed for this — we're calling api-layer functions directly).
++    deadline = _time.monotonic() + 10
++    while _time.monotonic() < deadline:
++        job = api._job_store.get(job_id)
++        if job and job.status.value in ("completed", "failed"):
++            break
++        _time.sleep(0.02)
++    body_dict = api._job_store.pop_result(job_id)
++    assert body_dict is not None, "job did not complete successfully"
++    # Round-trip through strict JSON — no bare NaN slipping in.
+     body = json.loads(
+-        response.body, parse_constant=lambda c: (_ for _ in ()).throw(ValueError(c))
++        json.dumps(body_dict),
++        parse_constant=lambda c: (_ for _ in ()).throw(ValueError(c)),
+     )
+     assert body["summary"]["keywords"] == 2
+ 
+diff --git a/clusteriq_engine/tests/test_async_jobs.py b/clusteriq_engine/tests/test_async_jobs.py
+new file mode 100644
+index 0000000..976d70b
+--- /dev/null
++++ b/clusteriq_engine/tests/test_async_jobs.py
+@@ -0,0 +1,229 @@
++"""Tests for the async job store and endpoints added in v1.4.0.
++
++These verify the contract the cluster-proxy edge function relies on:
++- submission returns {job_id, status, 202}
++- poll returns snapshots with status/progress and 404s for unknown ids
++- cancel is idempotent, works on queued jobs, tolerates already-terminal
++- restart-loss (unknown id) surfaces a recoverable error code
++- job store enforces its bounds (max_jobs, TTL)
++"""
++from __future__ import annotations
++
++import time
++
++import pytest
++from fastapi.testclient import TestClient
++
++from clusteriq_engine.jobs import Job, JobStatus, JobStore, TERMINAL
++
++
++CSV = (
++    b"keyword,volume\n"
++    b"best running shoes,5400\n"
++    b"buy running shoes online,3200\n"
++    b"how to choose running shoes,1900\n"
++    b"trail running shoes review,720\n"
++)
++
++
++@pytest.fixture()
++def client():
++    import clusteriq_engine.api as api
++    from clusteriq_engine.cache import ResultCache
++    api._result_cache = ResultCache(api._CACHE_ENTRIES, api._CACHE_BYTES)
++    api._job_store = JobStore(max_jobs=api._JOB_STORE_MAX, ttl_seconds=api._JOB_TTL_SECONDS)
++    return TestClient(api.app)
++
++
++# ==================================================================== #
++# JobStore unit tests
++# ==================================================================== #
++
++def test_store_create_get_snapshot():
++    s = JobStore()
++    j = s.create(row_count=42)
++    snap = s.get(j.id).snapshot()
++    assert snap["job_id"] == j.id
++    assert snap["status"] == "queued"
++    assert snap["progress"] == 0
++    assert snap["row_count"] == 42
++
++
++def test_store_status_transitions_are_monotonic():
++    s = JobStore()
++    j = s.create()
++    s.mark_processing(j.id)
++    assert s.get(j.id).status is JobStatus.PROCESSING
++    s.mark_completed(j.id, {"summary": {}})
++    assert s.get(j.id).status is JobStatus.COMPLETED
++    # A late failure on a completed job must be ignored (no going back).
++    s.mark_failed(j.id, "X", "should be ignored")
++    assert s.get(j.id).status is JobStatus.COMPLETED
++    assert s.get(j.id).error_message is None
++
++
++def test_progress_is_monotonic_and_capped():
++    s = JobStore()
++    j = s.create()
++    s.mark_processing(j.id)
++    s.update_progress(j.id, 40, "svd")
++    s.update_progress(j.id, 20, "reading")  # regression — ignored
++    s.update_progress(j.id, 150, "??")  # over-100 — clamped
++    j2 = s.get(j.id)
++    assert j2.progress == 99  # clamped just below 100 until mark_completed
++    assert j2.stage == "??"
++
++
++def test_pop_result_is_consume_once():
++    s = JobStore()
++    j = s.create()
++    s.mark_processing(j.id)
++    s.mark_completed(j.id, {"body": "x"})
++    assert s.pop_result(j.id) == {"body": "x"}
++    assert s.pop_result(j.id) is None  # already consumed
++    # But the job record itself is still there in COMPLETED.
++    assert s.get(j.id).status is JobStatus.COMPLETED
++
++
++def test_cancel_queued_is_immediate():
++    s = JobStore()
++    j = s.create()
++    assert s.request_cancel(j.id) is True
++    assert s.get(j.id).status is JobStatus.CANCELED
++
++
++def test_cancel_processing_sets_flag_only():
++    s = JobStore()
++    j = s.create()
++    s.mark_processing(j.id)
++    assert s.request_cancel(j.id) is True
++    # Still processing until the worker checks the flag.
++    assert s.get(j.id).status is JobStatus.PROCESSING
++    assert s.is_cancel_requested(j.id) is True
++
++
++def test_cancel_terminal_job_is_noop():
++    s = JobStore()
++    j = s.create()
++    s.mark_processing(j.id); s.mark_completed(j.id, {})
++    assert s.request_cancel(j.id) is False
++    assert s.get(j.id).status is JobStatus.COMPLETED
++
++
++def test_ttl_sweeps_terminal_jobs():
++    s = JobStore(ttl_seconds=0)  # instant expiry
++    j = s.create()
++    s.mark_processing(j.id); s.mark_completed(j.id, {})
++    # Next access triggers a sweep.
++    assert s.get(j.id) is None
++
++
++def test_max_jobs_evicts_terminal_first():
++    s = JobStore(max_jobs=2)
++    a = s.create(); s.mark_processing(a.id); s.mark_completed(a.id, {})
++    b = s.create()  # queued/live
++    c = s.create()  # forces eviction; the terminal 'a' should go, not the live 'b'
++    assert s.get(a.id) is None
++    assert s.get(b.id) is not None
++    assert s.get(c.id) is not None
++
++
++# ==================================================================== #
++# Endpoint contract (what cluster-proxy actually calls)
++# ==================================================================== #
++
++def _submit(client: TestClient):
++    return client.post(
++        "/cluster",
++        files={"file": ("kw.csv", CSV, "text/csv")},
++        data={"keyword_column": "keyword", "volume_column": "volume"},
++    )
++
++
++def _poll_until_terminal(client, job_id, timeout=15):
++    deadline = time.monotonic() + timeout
++    while time.monotonic() < deadline:
++        body = client.get(f"/jobs/{job_id}").json()
++        if body["status"] in ("completed", "failed", "canceled"):
++            return body
++        time.sleep(0.02)
++    pytest.fail(f"job {job_id} did not terminate")
++
++
++def test_submit_returns_202_with_job_id(client):
++    r = _submit(client)
++    assert r.status_code == 202
++    assert "job_id" in r.json()
++
++
++def test_poll_unknown_job_returns_job_not_found(client):
++    r = client.get("/jobs/does-not-exist")
++    assert r.status_code == 404
++    assert r.json()["detail"]["error"]["code"] == "JOB_NOT_FOUND"
++
++
++def test_result_before_completion_returns_job_not_ready(client):
++    """Fast-race case: the edge function may poll /result before the job is
++    done. We must return a distinct 409 with the current status/progress so
++    the poller can keep waiting rather than treating it as an error.
++
++    We drive this by creating a job directly in the store rather than via the
++    endpoint — the endpoint's background worker races the assertion and can
++    complete a small test CSV faster than we can poll."""
++    import clusteriq_engine.api as api
++    job = api._job_store.create()
++    api._job_store.mark_processing(job.id, stage="vectorizing")
++    r = client.get(f"/jobs/{job.id}/result")
++    assert r.status_code == 409
++    err = r.json()["detail"]["error"]
++    assert err["code"] == "JOB_NOT_READY"
++    assert err["status"] == "processing"
++
++
++def test_result_of_completed_job_matches_persistresults_shape(client):
++    submit = _submit(client).json()
++    _poll_until_terminal(client, submit["job_id"])
++    body = client.get(f"/jobs/{submit['job_id']}/result").json()
++    assert "clusters" in body and "rows" in body and "summary" in body
++
++
++def test_cancel_endpoint_delete_and_post_both_work(client):
++    """Edge function tries DELETE first, POST /cancel as fallback."""
++    submit1 = _submit(client).json()
++    r1 = client.delete(f"/jobs/{submit1['job_id']}")
++    assert r1.status_code == 200
++
++    submit2 = _submit(client).json()
++    r2 = client.post(f"/jobs/{submit2['job_id']}/cancel")
++    assert r2.status_code == 200
++
++
++def test_cancel_unknown_job_returns_404(client):
++    """DELETE on an unknown id should be a clean 404, not a false success."""
++    r = client.delete("/jobs/nope")
++    assert r.status_code == 404
++
++
++def test_repeated_cancel_is_idempotent(client):
++    """Cancel called twice on the same live job: second call reports no-op
++    truthfully, doesn't error. Uses the store directly to avoid racing the
++    background worker."""
++    import clusteriq_engine.api as api
++    job = api._job_store.create()
++    api._job_store.mark_processing(job.id)
++    r1 = client.delete(f"/jobs/{job.id}")
++    assert r1.status_code == 200 and r1.json()["canceled"] is True
++    # First cancel just sets the flag on a processing job (worker would check
++    # it) — but the store's status is still PROCESSING because no worker is
++    # running to promote it. Simulate the worker noticing:
++    api._job_store.mark_failed(job.id, "CANCELED", "Canceled by user")
++    r2 = client.delete(f"/jobs/{job.id}")
++    assert r2.status_code == 200
++    assert r2.json()["canceled"] is False  # already terminal
++
++
++def test_health_includes_jobs_stats(client):
++    _submit(client)  # populate at least one job
++    body = client.get("/health").json()
++    assert body["jobs"]["total"] >= 1
++    assert isinstance(body["jobs"]["by_status"], dict)
+diff --git a/clusteriq_engine/tests/test_cost_controls.py b/clusteriq_engine/tests/test_cost_controls.py
+index c93fda1..cf6bf86 100644
+--- a/clusteriq_engine/tests/test_cost_controls.py
++++ b/clusteriq_engine/tests/test_cost_controls.py
+@@ -1,16 +1,16 @@
+-"""Tests for the cost-control / practical-usage features added in v1.3.0:
+-result caching, the heavy-job row guard, enriched health, and — critically —
+-that the response contract the frontend depends on is unchanged.
++"""Tests for cost-control / practical-usage features updated for v1.4.0:
++async job submission (POST /cluster -> {job_id, status}), plus the contract
++that the poll+result endpoints preserve the shape persistResults consumes.
+ """
+ from __future__ import annotations
+ 
+-import importlib
+-import os
++import time
+ 
+ import pytest
+ from fastapi.testclient import TestClient
+ 
+ from clusteriq_engine.cache import ResultCache, result_cache_key
++from clusteriq_engine.jobs import JobStore
+ 
+ 
+ CSV = (
+@@ -26,13 +26,15 @@ CSV = (
+ @pytest.fixture()
+ def client():
+     import clusteriq_engine.api as api
+-    # Fresh cache per test so one test's cached result can't mask another's
+-    # first-call behaviour (cache hits are process-wide otherwise).
++    # Fresh cache AND fresh job store per test so cross-test contamination
++    # doesn't hide bugs (cache hits mask guard behaviour, terminal jobs from
++    # a prior test would still be enumerable via /health).
+     api._result_cache = ResultCache(api._CACHE_ENTRIES, api._CACHE_BYTES)
++    api._job_store = JobStore(max_jobs=api._JOB_STORE_MAX, ttl_seconds=api._JOB_TTL_SECONDS)
+     return TestClient(api.app)
+ 
+ 
+-def _post_cluster(client: TestClient, data=None):
++def _submit(client: TestClient, data=None):
+     return client.post(
+         "/cluster",
+         files={"file": ("kw.csv", CSV, "text/csv")},
+@@ -42,11 +44,50 @@ def _post_cluster(client: TestClient, data=None):
+     )
+ 
+ 
+-# --------------------------- response contract ---------------------------- #
+-
+-def test_cluster_response_contract_unchanged(client):
+-    """Every field persistResults reads must be present (frontend depends on it)."""
+-    body = _post_cluster(client).json()
++def _run_to_completion(client: TestClient, submit_body: dict, timeout_s: float = 30.0):
++    """Poll a job until terminal, then fetch its result. Mirrors the edge
++    function's flow. Returns the result body."""
++    job_id = submit_body["job_id"]
++    deadline = time.monotonic() + timeout_s
++    while time.monotonic() < deadline:
++        r = client.get(f"/jobs/{job_id}")
++        assert r.status_code == 200, r.text
++        status = r.json()["status"]
++        if status in ("completed", "failed", "canceled"):
++            break
++        time.sleep(0.05)
++    else:
++        pytest.fail(f"job {job_id} did not terminate within {timeout_s}s")
++    result = client.get(f"/jobs/{job_id}/result")
++    return result
++
++
++# --------------------------- submission contract -------------------------- #
++
++def test_submission_returns_job_id_and_202(client):
++    """POST /cluster must return {job_id, status:queued} with 202 — never the
++    old sync body. This is THE change; if this ever regresses, the edge
++    function's timeout problem is back."""
++    resp = _submit(client)
++    assert resp.status_code == 202, resp.text
++    body = resp.json()
++    assert set(body.keys()) >= {"job_id", "status"}
++    assert body["status"] == "queued"
++    assert isinstance(body["job_id"], str) and len(body["job_id"]) >= 8
++    # The old sync fields must NOT be in the submission response.
++    assert "clusters" not in body
++    assert "rows" not in body
++    assert "summary" not in body
++
++
++def test_completed_result_preserves_frontend_contract(client):
++    """After poll->completed, /jobs/{id}/result must return the exact shape
++    persistResults expects. This is the contract that used to be tested
++    against the sync body."""
++    submit = _submit(client).json()
++    result = _run_to_completion(client, submit)
++    assert result.status_code == 200, result.text
++    body = result.json()
+     assert set(["summary", "column_mapping", "columns_detected", "clusters", "rows"]).issubset(body)
+ 
+     cluster_keys = {
+@@ -61,23 +102,55 @@ def test_cluster_response_contract_unchanged(client):
+     }
+     assert cluster_keys.issubset(body["clusters"][0].keys())
+     assert row_keys.issubset(body["rows"][0].keys())
+-    # New fields are additive and must not be a job_id (that would trigger the
+-    # frontend's dormant async path).
+-    assert "job_id" not in body
+     assert body["cached"] is False
+     assert isinstance(body["timing_ms"], int)
+ 
+ 
++def test_poll_reports_status_progression(client):
++    """Poll must return job snapshots the edge function can update the DB
++    from — status, progress, and a job_id echoed back."""
++    submit = _submit(client).json()
++    job_id = submit["job_id"]
++
++    # Immediate poll: queued or already-processing (fast tests can race).
++    first = client.get(f"/jobs/{job_id}").json()
++    assert first["job_id"] == job_id
++    assert first["status"] in ("queued", "processing", "completed")
++    assert "progress" in first
++
++    # Drive to completion and confirm terminal snapshot shape.
++    _run_to_completion(client, submit)
++    final = client.get(f"/jobs/{job_id}").json()
++    assert final["status"] == "completed"
++    assert final["progress"] == 100
++
++
++def test_unknown_job_returns_404_with_recoverable_code(client):
++    """A missing job (e.g. after a Railway restart) must 404 with a code the
++    edge function can surface as 'please re-submit', not hang the frontend."""
++    resp = client.get("/jobs/nope-does-not-exist")
++    assert resp.status_code == 404
++    err = resp.json()["detail"]["error"]
++    assert err["code"] == "JOB_NOT_FOUND"
++
++
+ # ------------------------------- caching ---------------------------------- #
+ 
+-def test_identical_request_is_served_from_cache(client):
+-    first = _post_cluster(client).json()
+-    assert first["cached"] is False
+-    second = _post_cluster(client).json()
+-    assert second["cached"] is True
+-    # Cached body is otherwise identical (minus the cached flag).
+-    assert second["summary"] == first["summary"]
+-    assert second["clusters"] == first["clusters"]
++def test_cache_hit_short_circuits_via_job_id(client):
++    """A cached repeat still returns via the async contract — a completed job
++    the caller can poll and fetch immediately. Keeps the frontend polling
++    path uniform (no special sync case)."""
++    first_submit = _submit(client).json()
++    first_result = _run_to_completion(client, first_submit).json()
++    assert first_result["cached"] is False
++
++    second_submit = _submit(client)
++    assert second_submit.status_code == 202
++    body = second_submit.json()
++    assert body.get("cached") is True  # flag on the submission itself
++    second_result = _run_to_completion(client, body).json()
++    assert second_result["cached"] is True
++    assert second_result["summary"] == first_result["summary"]
+ 
+ 
+ def test_cache_key_varies_with_mapping():
+@@ -89,36 +162,48 @@ def test_cache_key_varies_with_mapping():
+ 
+ 
+ def test_result_cache_lru_and_byte_bounds():
+-    # Tiny budget: only 1 entry fits -> oldest is evicted.
+     cache = ResultCache(max_entries=1, max_total_bytes=0)
+     cache.put("a", {"x": 1})
+     cache.put("b", {"y": 2})
+-    assert cache.get("a") is None      # evicted
++    assert cache.get("a") is None
+     assert cache.get("b") == {"y": 2}
+ 
+     disabled = ResultCache(max_entries=0, max_total_bytes=0)
+     disabled.put("a", {"x": 1})
+-    assert disabled.get("a") is None   # disabled never stores
++    assert disabled.get("a") is None
+ 
+ 
+ # --------------------------- heavy-job guard ------------------------------ #
+ 
+-def test_heavy_job_row_limit_returns_413(monkeypatch):
+-    """A file over the row limit is refused fast with a clear 413, not run."""
++def test_heavy_job_row_limit_fails_the_job(monkeypatch):
++    """A file over the row limit no longer 413s at submission (the request
++    was accepted); instead the JOB terminates as failed with TOO_MANY_ROWS.
++    The edge function surfaces this via the poll loop."""
+     import clusteriq_engine.api as api
+ 
+-    # Fresh cache: a prior test may have cached this CSV, which would short-
+-    # circuit before the row guard (a cached result is served without reprocessing
+-    # — correct in prod, but here we want to exercise the guard itself).
+     api._result_cache = ResultCache(api._CACHE_ENTRIES, api._CACHE_BYTES)
++    api._job_store = JobStore(max_jobs=api._JOB_STORE_MAX, ttl_seconds=api._JOB_TTL_SECONDS)
+     monkeypatch.setattr(api, "HEAVY_JOB_ROW_LIMIT", 3)  # our CSV has 5 rows
+     client = TestClient(api.app)
+-    resp = _post_cluster(client)
+-    assert resp.status_code == 413
+-    err = resp.json()["detail"]["error"]
+-    assert err["code"] == "TOO_MANY_ROWS"
+-    assert err["row_count"] == 5
+-    assert err["limit"] == 3
++
++    submit = _submit(client)
++    assert submit.status_code == 202  # accepted — we don't know row count until we parse
++    job_id = submit.json()["job_id"]
++
++    deadline = time.monotonic() + 10
++    while time.monotonic() < deadline:
++        status = client.get(f"/jobs/{job_id}").json()["status"]
++        if status in ("completed", "failed", "canceled"):
++            break
++        time.sleep(0.05)
++    final = client.get(f"/jobs/{job_id}").json()
++    assert final["status"] == "failed"
++    assert final["error_code"] == "TOO_MANY_ROWS"
++    # /result on a failed job must 422 with the same code — this is what the
++    # edge function forwards to the frontend.
++    r = client.get(f"/jobs/{job_id}/result")
++    assert r.status_code == 422
++    assert r.json()["detail"]["error"]["code"] == "TOO_MANY_ROWS"
+ 
+ 
+ # ------------------------------- health ----------------------------------- #
+@@ -128,3 +213,6 @@ def test_health_reports_runtime_stats(client):
+     assert body["status"] == "ok"
+     assert "active_jobs" in body and "max_jobs" in body
+     assert "cache" in body and "enabled" in body["cache"]
++    # New in v1.4.0: job store stats visible for ops-at-a-glance.
++    assert "jobs" in body
++    assert set(body["jobs"].keys()) >= {"total", "by_status", "max_jobs", "ttl_seconds"}
+diff --git a/railway.toml b/railway.toml
+index 03f5398..dfef8f3 100644
+--- a/railway.toml
++++ b/railway.toml
+@@ -34,6 +34,10 @@ restartPolicyMaxRetries = 10
+ #   HEAVY_JOB_ROW_LIMIT       = 100000   # the pipeline's absolute MAX_ROWS
+ #   CLUSTER_CACHE_MB          = 128
+ #
++# Async jobs (v1.4.0):
++#   JOB_TTL_SECONDS           = 3600     # how long finished job records survive
++#   JOB_WORKER_THREADS        = 1        # keep equal to MAX_CONCURRENT_JOBS
++#
+ # Always:
+ #   ALLOWED_ORIGINS           = https://<your-frontend-domain>
+ #   RATE_LIMIT_PER_MINUTE     = 120      # shared across all users (one egress IP)
