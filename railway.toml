@@ -1,5 +1,5 @@
 [build]
-builder = "NIXPACKS"
+builder = "Railpack"
 
 [deploy]
 startCommand = "uvicorn clusteriq_engine.api:app --host 0.0.0.0 --port $PORT"
