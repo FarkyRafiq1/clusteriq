@@ -225,9 +225,17 @@ def persist_results(
     project_id: str,
     job_id: Optional[str] = None,
     client: Optional[httpx.Client] = None,
+    base_url: Optional[str] = None,
+    service_key: Optional[str] = None,
 ) -> int:
-    """Module-level convenience wrapper (also the seam tests use)."""
-    p = SupabasePersistence(client=client)
+    """Module-level convenience wrapper (also the seam tests use).
+
+    `base_url`/`service_key`, when given, take precedence over the env vars —
+    this is the per-request credential path used with Lovable Cloud, where
+    the service-role key is only ever available inside the edge function.
+    SECURITY: callers must never log these values.
+    """
+    p = SupabasePersistence(base_url=base_url, service_key=service_key, client=client)
     try:
         return p.persist_results(result, upload_id, project_id, job_id)
     finally:

@@ -76,7 +76,7 @@ async def _lifespan(app: FastAPI):
     # Shutdown: nothing to clean up (in-process state is GC'd).
 
 
-app = FastAPI(title="ClusterIQ Engine", version="1.4.1", lifespan=_lifespan)
+app = FastAPI(title="ClusterIQ Engine", version="1.4.2", lifespan=_lifespan)
 
 app.add_middleware(
     CORSMiddleware,
@@ -287,6 +287,12 @@ async def cluster_file(
     url_column: Optional[str] = Form("url"),
     upload_id: Optional[str] = Form(None),
     project_id: Optional[str] = Form(None),
+    # Per-request persistence credentials (v1.4.2). Lovable Cloud never
+    # exposes the service-role key to humans — only to edge functions — so
+    # the edge function hands it to the engine with each submit. SECURITY:
+    # these must never be logged, stored in job records, or echoed back.
+    supabase_url: Optional[str] = Form(None),
+    supabase_key: Optional[str] = Form(None),
 ) -> JSONResponse:
     """Submit a clustering job for asynchronous processing.
 
@@ -305,6 +311,15 @@ async def cluster_file(
     edge function surfaces to the frontend as a clear failure the user can
     retry (rather than a spinner that hangs forever).
     """
+    # When this function is invoked directly (tests, scripts) instead of via
+    # FastAPI's request pipeline, unfilled Form(...) defaults arrive as the
+    # sentinel objects themselves — which are truthy. Normalise to real
+    # strings-or-None before any of them participate in logic.
+    upload_id = upload_id if isinstance(upload_id, str) and upload_id else None
+    project_id = project_id if isinstance(project_id, str) and project_id else None
+    supabase_url = supabase_url if isinstance(supabase_url, str) and supabase_url else None
+    supabase_key = supabase_key if isinstance(supabase_key, str) and supabase_key else None
+
     _enforce_rate_limit(request)
     try:
         # Read the upload BEFORE returning: if the file is malformed or over the
@@ -335,18 +350,24 @@ async def cluster_file(
             column_mapping,
             {"engine_version": app.version, "backend": config.semantic_backend},
         )
+        can_persist = bool(
+            upload_id and project_id
+            and ((supabase_url and supabase_key) or persistence.configured())
+        )
+
         cached = _result_cache.get(cache_key)
         if cached is not None:
             job = _job_store.create()
             cached_body = {**cached, "cached": True}
-            if upload_id and project_id and persistence.configured():
+            if can_persist:
                 # Recovery path: a repeat submit after a failed persist must
                 # persist again. Cheap — computation is skipped entirely.
                 loop = asyncio.get_running_loop()
                 loop.run_in_executor(
                     None, _run_clustering_job,
                     job.id, payload, file.filename or "upload", config,
-                    column_mapping, cache_key, upload_id, project_id, cached_body,
+                    column_mapping, cache_key, upload_id, project_id,
+                    supabase_url, supabase_key, cached_body,
                 )
             else:
                 _job_store.mark_processing(job.id, stage="cache")
@@ -372,7 +393,7 @@ async def cluster_file(
             None,
             _run_clustering_job,
             job.id, payload, filename, config, column_mapping, cache_key,
-            upload_id, project_id, None,
+            upload_id, project_id, supabase_url, supabase_key, None,
         )
 
         return JSONResponse(
@@ -396,6 +417,8 @@ def _run_clustering_job(
     cache_key: str,
     upload_id: Optional[str] = None,
     project_id: Optional[str] = None,
+    supabase_url: Optional[str] = None,
+    supabase_key: Optional[str] = None,
     cached_body: Optional[Dict[str, Any]] = None,
 ) -> None:
     """Runs in a background thread. Marshals the pipeline through the JobStore.
@@ -418,7 +441,8 @@ def _run_clustering_job(
                 # Cache hit with a persistence context: skip computation,
                 # persist the cached result (recovery after a failed persist).
                 _job_store.mark_processing(job_id, stage="cache")
-                _finish_job(job_id, dict(cached_body), upload_id, project_id)
+                _finish_job(job_id, dict(cached_body), upload_id, project_id,
+                            supabase_url, supabase_key)
                 return
 
             _job_store.mark_processing(job_id, stage="reading")
@@ -454,7 +478,8 @@ def _run_clustering_job(
                 raise CanceledError()
 
             _result_cache.put(cache_key, body)
-            _finish_job(job_id, body, upload_id, project_id)
+            _finish_job(job_id, body, upload_id, project_id,
+                        supabase_url, supabase_key)
             logger.info(
                 "job %s clustered %d rows -> %d clusters in %d ms",
                 job_id, len(df), len(body.get("clusters", [])), elapsed_ms,
@@ -483,6 +508,8 @@ def _finish_job(
     body: Dict[str, Any],
     upload_id: Optional[str],
     project_id: Optional[str],
+    supabase_url: Optional[str] = None,
+    supabase_key: Optional[str] = None,
 ) -> None:
     """Complete a job: persist directly to Supabase when configured and a
     persistence context was supplied; otherwise keep v1.4.0 behaviour (full
@@ -492,10 +519,15 @@ def _finish_job(
     ~18 MB body never travels through the edge-function isolate again, which
     is the whole point of v1.4.1.
     """
-    if upload_id and project_id and persistence.configured():
+    has_request_creds = bool(supabase_url and supabase_key)
+    if upload_id and project_id and (has_request_creds or persistence.configured()):
         _job_store.update_progress(job_id, 85, "persisting")
+        # Per-request credentials (edge-function supplied) take precedence:
+        # they are always current, so a platform-side key rotation can never
+        # strand the engine with a stale copy. NEVER log these values.
         cluster_count = persistence.persist_results(
-            body, upload_id, project_id, job_id
+            body, upload_id, project_id, job_id,
+            base_url=supabase_url, service_key=supabase_key,
         )  # raises PersistError on failure -> handled by the worker
         compact = {
             "success": True,
