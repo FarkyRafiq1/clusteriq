@@ -172,3 +172,26 @@ Notes: `TOO_MANY_ROWS` now arrives as a failed job (row count is only known
 after parsing), not a submission-time 413. Job state is in-process and does
 not survive restarts — the cluster-proxy edge function marks the DB row failed
 when it sees the 404, so the UI shows "re-submit" rather than spinning.
+
+
+## Direct persistence (v1.4.1)
+
+**Lovable Cloud (recommended path): no variables needed.** The edge function
+passes `supabase_url` + `supabase_key` per request; they take precedence over
+any env configuration and are held in memory only.
+
+**Standard/external Supabase (fallback):** set on Railway to have the engine
+write results straight to the database:
+
+| Variable | Value |
+|---|---|
+| `SUPABASE_URL` | `https://<project-ref>.supabase.co` |
+| `SUPABASE_SERVICE_ROLE_KEY` | service-role secret (server-side only — never in the frontend) |
+
+With these set and the edge function passing `upload_id`/`project_id`, a
+completed job's result is a compact summary (`persisted: true`,
+`cluster_count`, `row_count`, `summary`) and the clusters/keywords are already
+in the database. Without them, the engine serves the full body and the edge
+function persists (legacy v1.4.0 flow). `/health` shows `"persistence"` state.
+Re-submitting after a failed persist is cheap: the engine re-persists from
+cache without recomputing.

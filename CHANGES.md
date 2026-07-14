@@ -1,3 +1,51 @@
+## v1.4.2 — per-request persistence credentials (the Lovable Cloud path)
+
+Lovable Cloud never exposes the Supabase service-role key to humans — it
+exists only inside the edge-function environment. So instead of an operator
+copying the key into Railway (impossible on Lovable Cloud), the edge function
+now hands `supabase_url` + `supabase_key` to the engine with each submit,
+alongside `upload_id`/`project_id`. Server-to-server over TLS; the engine
+holds them in memory for the job only, never logs, stores, or echoes them
+(leak-tested against every observable surface). Per-request credentials take
+precedence over the env vars, which remain as an optional fallback for
+standard/external Supabase setups — so a platform-side key rotation can never
+strand the engine with a stale copy.
+
+Also hardened: optional Form fields are normalised at the endpoint boundary
+(direct invocation passes truthy Form sentinels, not None — caught by the
+hardening suite). 91 tests (5 new).
+## v1.4.1 — engine-direct persistence: results written straight to Supabase
+
+Fixes the WORKER_LIMIT kill ("Function failed due to not having enough compute
+resources") that destroyed results during persistence. Root cause: the edge
+function — a free-tier Deno isolate with ~2 s of CPU — was parsing an ~18 MB
+result body, inserting ~20k+ cluster rows in ONE call with a `.select()`
+echoing them all back, then ~26k keyword rows in ~53 sequential inserts. The
+same code path killed v1.3.x runs silently (browser saw a hung request die
+with no error) and v1.4.0 runs loudly (failed job with an id).
+
+Now: when the edge function passes `upload_id` + `project_id` on submit and
+`SUPABASE_URL` / `SUPABASE_SERVICE_ROLE_KEY` are set on Railway, the engine's
+worker persists results directly (new `clusteriq_engine/persistence.py` —
+faithful port of the edge function's persistResults: same tables/columns,
+plus client-side UUIDs so no insert echo, chunked cluster inserts, and an
+idempotent delete-before-insert so retries can't duplicate). The job's stored
+result becomes a compact summary (`persisted: true, cluster_count, row_count,
+summary`) — the 18 MB payload never enters the isolate again. Cache hits with
+a persistence context re-persist from the cached body (the recovery path
+after a failed persist). Persist failures mark the job `PERSIST_FAILED` with
+a clear retry message.
+
+Unset the variables (or omit the context) and behaviour is exactly v1.4.0 —
+full body served, edge function persists — so deploy order is safe.
+
+Companion edge-function v2 (frontend repo): passes the context through,
+handles compact results with a legacy-persist fallback, and restores workspace
+usage metering (previously only wired on the unreachable sync branch, so
+async jobs ran quota-free).
+
+Also: `railway.toml` builder corrected to RAILPACK (matches the service);
+`/health` reports `"persistence": true/false`. 86 tests (12 new).
 ## v1.4.0 — async clustering: POST /cluster always returns a job
 
 Fixes the 150 s Supabase edge-function wall clock killing long jobs: the engine
