@@ -19,6 +19,7 @@ from .cache import ResultCache, result_cache_key
 from .errors import UserError
 from .hardening import JobSlots, RateLimiter, ServerBusy, client_ip, read_upload_limited
 from .ingest import MAX_UPLOAD_BYTES, resolve_columns
+from . import persistence
 from .jobs import CanceledError, JobStatus, JobStore
 from .pipeline import ClusterPipeline
 from .schemas import PipelineConfig
@@ -75,7 +76,7 @@ async def _lifespan(app: FastAPI):
     # Shutdown: nothing to clean up (in-process state is GC'd).
 
 
-app = FastAPI(title="ClusterIQ Engine", version="1.4.0", lifespan=_lifespan)
+app = FastAPI(title="ClusterIQ Engine", version="1.4.1", lifespan=_lifespan)
 
 app.add_middleware(
     CORSMiddleware,
@@ -221,6 +222,7 @@ def health() -> Dict[str, Any]:
         "max_jobs": _job_slots.max_jobs,
         "cache": _result_cache.stats(),
         "jobs": _job_store.stats(),
+        "persistence": persistence.configured(),
     }
 
 
@@ -283,6 +285,8 @@ async def cluster_file(
     difficulty_column: Optional[str] = Form("difficulty"),
     rank_column: Optional[str] = Form("position"),
     url_column: Optional[str] = Form("url"),
+    upload_id: Optional[str] = Form(None),
+    project_id: Optional[str] = Form(None),
 ) -> JSONResponse:
     """Submit a clustering job for asynchronous processing.
 
@@ -335,9 +339,19 @@ async def cluster_file(
         if cached is not None:
             job = _job_store.create()
             cached_body = {**cached, "cached": True}
-            _job_store.mark_processing(job.id, stage="cache")
-            _job_store.mark_completed(job.id, cached_body)
-            logger.info("cache hit — job %s returned immediately", job.id)
+            if upload_id and project_id and persistence.configured():
+                # Recovery path: a repeat submit after a failed persist must
+                # persist again. Cheap — computation is skipped entirely.
+                loop = asyncio.get_running_loop()
+                loop.run_in_executor(
+                    None, _run_clustering_job,
+                    job.id, payload, file.filename or "upload", config,
+                    column_mapping, cache_key, upload_id, project_id, cached_body,
+                )
+            else:
+                _job_store.mark_processing(job.id, stage="cache")
+                _job_store.mark_completed(job.id, cached_body)
+            logger.info("cache hit — job %s", job.id)
             return JSONResponse(
                 {"job_id": job.id, "status": "queued", "cached": True},
                 status_code=202,
@@ -358,6 +372,7 @@ async def cluster_file(
             None,
             _run_clustering_job,
             job.id, payload, filename, config, column_mapping, cache_key,
+            upload_id, project_id, None,
         )
 
         return JSONResponse(
@@ -379,6 +394,9 @@ def _run_clustering_job(
     config: PipelineConfig,
     column_mapping: Dict[str, Optional[str]],
     cache_key: str,
+    upload_id: Optional[str] = None,
+    project_id: Optional[str] = None,
+    cached_body: Optional[Dict[str, Any]] = None,
 ) -> None:
     """Runs in a background thread. Marshals the pipeline through the JobStore.
 
@@ -395,6 +413,14 @@ def _run_clustering_job(
         try:
             if _job_store.is_cancel_requested(job_id):
                 raise CanceledError()
+
+            if cached_body is not None:
+                # Cache hit with a persistence context: skip computation,
+                # persist the cached result (recovery after a failed persist).
+                _job_store.mark_processing(job_id, stage="cache")
+                _finish_job(job_id, dict(cached_body), upload_id, project_id)
+                return
+
             _job_store.mark_processing(job_id, stage="reading")
 
             df = pipeline.read_table(payload, filename)
@@ -428,11 +454,19 @@ def _run_clustering_job(
                 raise CanceledError()
 
             _result_cache.put(cache_key, body)
-            _job_store.mark_completed(job_id, body)
+            _finish_job(job_id, body, upload_id, project_id)
             logger.info(
                 "job %s clustered %d rows -> %d clusters in %d ms",
                 job_id, len(df), len(body.get("clusters", [])), elapsed_ms,
             )
+        except persistence.PersistError as exc:
+            _job_store.mark_failed(
+                job_id,
+                code="PERSIST_FAILED",
+                message=f"Clustering succeeded but saving results failed: {exc}. "
+                        f"Re-submit the file to retry (the result is cached).",
+            )
+            logger.exception("job %s persist failed", job_id)
         except CanceledError:
             _job_store.mark_failed(job_id, code="CANCELED", message="Canceled by user")
             logger.info("job %s canceled", job_id)
@@ -442,6 +476,39 @@ def _run_clustering_job(
         except Exception as exc:  # noqa: BLE001 - worker boundary
             logger.exception("job %s failed unexpectedly", job_id)
             _job_store.mark_failed(job_id, code="INTERNAL_ERROR", message=str(exc) or "Clustering failed")
+
+
+def _finish_job(
+    job_id: str,
+    body: Dict[str, Any],
+    upload_id: Optional[str],
+    project_id: Optional[str],
+) -> None:
+    """Complete a job: persist directly to Supabase when configured and a
+    persistence context was supplied; otherwise keep v1.4.0 behaviour (full
+    body stored, consume-once, edge function persists it).
+
+    When the engine persists, the stored result is a compact summary — the
+    ~18 MB body never travels through the edge-function isolate again, which
+    is the whole point of v1.4.1.
+    """
+    if upload_id and project_id and persistence.configured():
+        _job_store.update_progress(job_id, 85, "persisting")
+        cluster_count = persistence.persist_results(
+            body, upload_id, project_id, job_id
+        )  # raises PersistError on failure -> handled by the worker
+        compact = {
+            "success": True,
+            "persisted": True,
+            "cluster_count": cluster_count,
+            "row_count": len(body.get("rows") or []),
+            "summary": body.get("summary"),
+            "timing_ms": body.get("timing_ms"),
+            "cached": bool(body.get("cached")),
+        }
+        _job_store.mark_completed(job_id, compact)
+    else:
+        _job_store.mark_completed(job_id, body)
 
 
 # =========================================================================== #
